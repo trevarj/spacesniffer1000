@@ -16,7 +16,8 @@ pub struct ActiveScan {
     nodes: Vec<Node>,
     event_rx: Receiver<ScanEvent>,
     event_tx: Sender<ScanEvent>,
-    queued: VecDeque<(TreeIndex, ScanOptions)>,
+    queued: VecDeque<ScanJob>,
+    background_queued: VecDeque<ScanJob>,
     pub root: PathBuf,
     pub finished: bool,
     pub stats: ScanStats,
@@ -47,15 +48,37 @@ struct Node {
     metadata_error: bool,
     parent: Option<TreeIndex>,
     children: Vec<TreeIndex>,
+    boundary_dev: Option<u64>,
     scanned: bool,
     scanning: bool,
+    summarized: bool,
+    summarizing: bool,
 }
 
 #[derive(Debug)]
-struct ScanEvent {
-    parent: TreeIndex,
-    children: Vec<ScannedEntry>,
-    stats: ScanStats,
+enum ScanEvent {
+    Children {
+        parent: TreeIndex,
+        children: Vec<ScannedEntry>,
+        options: ScanOptions,
+        stats: ScanStats,
+    },
+    Summary {
+        index: TreeIndex,
+        summary: Summary,
+    },
+}
+
+#[derive(Debug)]
+enum ScanJob {
+    Children(TreeIndex, ScanOptions),
+    Summary(TreeIndex, ScanOptions),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobPriority {
+    Interactive,
+    Background,
 }
 
 #[derive(Debug)]
@@ -67,6 +90,7 @@ struct ScannedEntry {
     is_dir: bool,
     entry_count: Option<u64>,
     metadata_error: bool,
+    boundary_dev: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +103,7 @@ pub struct EntryView {
     pub is_dir: bool,
     pub entry_count: Option<u64>,
     pub metadata_error: bool,
+    pub size_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,8 +130,11 @@ impl ActiveScan {
             metadata_error: false,
             parent: None,
             children: Vec::new(),
+            boundary_dev: Some(metadata.dev()),
             scanned: false,
             scanning: false,
+            summarized: !metadata.is_dir(),
+            summarizing: false,
         };
 
         let mut scan = Self {
@@ -114,6 +142,7 @@ impl ActiveScan {
             event_rx,
             event_tx,
             queued: VecDeque::new(),
+            background_queued: VecDeque::new(),
             root,
             finished: false,
             stats: ScanStats::default(),
@@ -132,7 +161,12 @@ impl ActiveScan {
             self.integrate_event(event);
         }
         self.start_queued_jobs();
-        self.finished = self.stats.active_jobs == 0;
+        self.finished = self.stats.active_jobs == 0
+            && self.queued.is_empty()
+            && self.background_queued.is_empty();
+        if self.finished {
+            self.mark_completed_summary_flags();
+        }
         changed
     }
 
@@ -142,7 +176,7 @@ impl ActiveScan {
             && !node.scanned
             && !node.scanning
         {
-            self.enqueue_scan(index, options);
+            self.enqueue_job(ScanJob::Children(index, options), JobPriority::Interactive);
         }
     }
 
@@ -159,27 +193,80 @@ impl ActiveScan {
         }
     }
 
-    fn enqueue_scan(&mut self, index: TreeIndex, options: ScanOptions) {
-        if self
-            .queued
-            .iter()
-            .any(|(queued_index, _)| *queued_index == index)
-        {
+    fn enqueue_job(&mut self, job: ScanJob, priority: JobPriority) {
+        if self.job_is_redundant(&job) {
             return;
         }
-        if self.stats.active_jobs < MAX_SCAN_JOBS {
-            self.scan_children(index, options);
-        } else {
-            self.queued.push_back((index, options));
+        if self.can_start_job(priority) {
+            self.start_job(job);
+            return;
+        }
+
+        match priority {
+            JobPriority::Interactive => self.queued.push_back(job),
+            JobPriority::Background => self.background_queued.push_back(job),
         }
     }
 
     fn start_queued_jobs(&mut self) {
         while self.stats.active_jobs < MAX_SCAN_JOBS {
-            let Some((index, options)) = self.queued.pop_front() else {
+            let Some(job) = self.queued.pop_front() else {
                 break;
             };
-            self.scan_children(index, options);
+            self.start_job(job);
+        }
+
+        if self.stats.active_jobs == 0
+            && let Some(job) = self.background_queued.pop_front()
+        {
+            self.start_job(job);
+        }
+    }
+
+    fn start_job(&mut self, job: ScanJob) {
+        match job {
+            ScanJob::Children(index, options) => self.scan_children(index, options),
+            ScanJob::Summary(index, options) => self.summarize_node(index, options),
+        }
+    }
+
+    fn job_is_redundant(&self, job: &ScanJob) -> bool {
+        match job {
+            ScanJob::Children(index, _) => {
+                let Some(node) = self.nodes.get(*index) else {
+                    return true;
+                };
+                node.scanned
+                    || node.scanning
+                    || self.queued.iter().any(|queued| {
+                        matches!(queued, ScanJob::Children(queued_index, _) if queued_index == index)
+                    })
+                    || self.background_queued.iter().any(|queued| {
+                        matches!(queued, ScanJob::Children(queued_index, _) if queued_index == index)
+                    })
+            }
+            ScanJob::Summary(index, _) => {
+                let Some(node) = self.nodes.get(*index) else {
+                    return true;
+                };
+                node.summarized
+                    || node.summarizing
+                    || self.queued.iter().any(|queued| {
+                        matches!(queued, ScanJob::Summary(queued_index, _) if queued_index == index)
+                    })
+                    || self.background_queued.iter().any(|queued| {
+                        matches!(queued, ScanJob::Summary(queued_index, _) if queued_index == index)
+                    })
+            }
+        }
+    }
+
+    fn can_start_job(&self, priority: JobPriority) -> bool {
+        match priority {
+            JobPriority::Interactive => self.stats.active_jobs < MAX_SCAN_JOBS,
+            // Background summaries run only when the scanner is otherwise idle. That keeps one
+            // worker slot available for click-driven subtree scans while sizes refine gradually.
+            JobPriority::Background => self.stats.active_jobs == 0 && self.queued.is_empty(),
         }
     }
 
@@ -206,17 +293,62 @@ impl ActiveScan {
             .expect("spawn directory scanner");
     }
 
-    fn integrate_event(&mut self, event: ScanEvent) {
-        if self.nodes.get(event.parent).is_none() {
+    fn summarize_node(&mut self, index: TreeIndex, options: ScanOptions) {
+        let Some(node) = self.nodes.get_mut(index) else {
+            return;
+        };
+        if node.summarized || node.summarizing {
             return;
         }
 
-        let parent_size = event.children.iter().map(|child| child.size).sum();
-        let parent_count = event.children.len() as u64;
-        let mut child_indices = Vec::with_capacity(event.children.len());
+        node.summarizing = true;
+        self.finished = false;
+        self.stats.active_jobs += 1;
+        let path = node.path.clone();
+        let boundary_dev = node.boundary_dev;
+        let tx = self.event_tx.clone();
 
-        for child in event.children {
+        std::thread::Builder::new()
+            .name("spacesniffer-summary-scan".into())
+            .spawn(move || {
+                let summary = summarize_path_from_fs(&path, boundary_dev, options);
+                let _ = tx.send(ScanEvent::Summary { index, summary });
+            })
+            .expect("spawn summary scanner");
+    }
+
+    fn integrate_event(&mut self, event: ScanEvent) {
+        match event {
+            ScanEvent::Children {
+                parent,
+                children,
+                options,
+                stats,
+            } => self.integrate_children(parent, children, options, stats),
+            ScanEvent::Summary { index, summary } => self.integrate_summary(index, summary),
+        }
+        self.start_queued_jobs();
+    }
+
+    fn integrate_children(
+        &mut self,
+        parent: TreeIndex,
+        children: Vec<ScannedEntry>,
+        options: ScanOptions,
+        stats: ScanStats,
+    ) {
+        if self.nodes.get(parent).is_none() {
+            self.stats.active_jobs = self.stats.active_jobs.saturating_sub(1);
+            return;
+        }
+
+        let parent_size = children.iter().map(|child| child.size).sum();
+        let parent_count = children.len() as u64;
+        let mut child_indices = Vec::with_capacity(children.len());
+
+        for child in children {
             let index = self.nodes.len();
+            let should_summarize = child.is_dir;
             child_indices.push(index);
             self.nodes.push(Node {
                 name: child.name,
@@ -226,25 +358,95 @@ impl ActiveScan {
                 is_dir: child.is_dir,
                 entry_count: child.entry_count,
                 metadata_error: child.metadata_error,
-                parent: Some(event.parent),
+                parent: Some(parent),
                 children: Vec::new(),
+                boundary_dev: child.boundary_dev,
                 scanned: false,
                 scanning: false,
+                summarized: !should_summarize,
+                summarizing: false,
             });
+            if should_summarize {
+                self.enqueue_job(ScanJob::Summary(index, options), JobPriority::Background);
+            }
         }
 
-        let parent = &mut self.nodes[event.parent];
-        parent.children = child_indices;
-        parent.scanned = true;
-        parent.scanning = false;
-        parent.size = parent_size;
-        parent.entry_count = Some(parent_count);
+        let update_parent_size = !self.nodes[parent].summarized;
+        let old_size = self.nodes[parent].size;
+        {
+            let parent_node = &mut self.nodes[parent];
+            parent_node.children = child_indices;
+            parent_node.scanned = true;
+            parent_node.scanning = false;
+            if update_parent_size {
+                parent_node.size = parent_size;
+                parent_node.entry_count = Some(parent_count);
+            }
+        }
+        if update_parent_size {
+            self.propagate_size_delta(parent, old_size, parent_size);
+        }
 
-        self.stats.entries_traversed += event.stats.entries_traversed;
-        self.stats.io_errors += event.stats.io_errors;
+        self.stats.entries_traversed += stats.entries_traversed;
+        self.stats.io_errors += stats.io_errors;
         self.stats.total_bytes = self.nodes.first().map(|node| node.size);
         self.stats.active_jobs = self.stats.active_jobs.saturating_sub(1);
-        self.start_queued_jobs();
+    }
+
+    fn integrate_summary(&mut self, index: TreeIndex, summary: Summary) {
+        if self.nodes.get(index).is_none() {
+            self.stats.active_jobs = self.stats.active_jobs.saturating_sub(1);
+            return;
+        }
+
+        let old_size = self.nodes[index].size;
+        {
+            let node = &mut self.nodes[index];
+            node.size = summary.size;
+            node.entry_count = node.is_dir.then_some(summary.entry_count);
+            node.metadata_error |= summary.metadata_error;
+            node.summarized = true;
+            node.summarizing = false;
+        }
+        self.propagate_size_delta(index, old_size, summary.size);
+
+        self.stats.entries_traversed += summary.entries_seen;
+        self.stats.io_errors += summary.io_errors;
+        self.stats.total_bytes = self.nodes.first().map(|node| node.size);
+        self.stats.active_jobs = self.stats.active_jobs.saturating_sub(1);
+    }
+
+    fn propagate_size_delta(&mut self, index: TreeIndex, old_size: u128, new_size: u128) {
+        let delta = new_size as i128 - old_size as i128;
+        if delta == 0 {
+            return;
+        }
+
+        let mut current = self.nodes.get(index).and_then(|node| node.parent);
+        while let Some(parent_index) = current {
+            let parent = &mut self.nodes[parent_index];
+            parent.size = parent.size.saturating_add_signed(delta);
+            current = parent.parent;
+        }
+    }
+
+    fn mark_completed_summary_flags(&mut self) {
+        for index in (0..self.nodes.len()).rev() {
+            if !self.nodes[index].is_dir
+                || self.nodes[index].summarized
+                || self.nodes[index].summarizing
+                || !self.nodes[index].scanned
+            {
+                continue;
+            }
+            let complete = self.nodes[index]
+                .children
+                .iter()
+                .all(|child| self.nodes.get(*child).is_some_and(|node| node.summarized));
+            if complete {
+                self.nodes[index].summarized = true;
+            }
+        }
     }
 }
 
@@ -271,6 +473,7 @@ pub fn entry_view(scan: &ActiveScan, index: TreeIndex) -> Option<EntryView> {
         is_dir: node.is_dir,
         entry_count: node.entry_count,
         metadata_error: node.metadata_error,
+        size_pending: node.is_dir && !node.summarized,
     })
 }
 
@@ -310,9 +513,10 @@ fn scan_directory_level(parent: TreeIndex, path: PathBuf, options: ScanOptions) 
 
     let Ok(read_dir) = fs::read_dir(&path) else {
         stats.io_errors += 1;
-        return ScanEvent {
+        return ScanEvent::Children {
             parent,
             children,
+            options,
             stats,
         };
     };
@@ -327,19 +531,15 @@ fn scan_directory_level(parent: TreeIndex, path: PathBuf, options: ScanOptions) 
         match fs::symlink_metadata(&child_path) {
             Ok(metadata) => {
                 let is_dir = metadata.is_dir();
-                let mut visited = HashSet::new();
-                let summary =
-                    summarize_path(&child_path, &metadata, root_dev, options, &mut visited);
-                stats.entries_traversed += summary.entries_seen;
-                stats.io_errors += summary.io_errors;
                 children.push(ScannedEntry {
                     name: entry.file_name().to_string_lossy().to_string(),
                     path: child_path,
-                    size: summary.size,
+                    size: disk_size(&metadata, options.apparent_size),
                     modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                     is_dir,
-                    entry_count: is_dir.then_some(summary.entry_count),
-                    metadata_error: summary.metadata_error,
+                    entry_count: None,
+                    metadata_error: false,
+                    boundary_dev: root_dev,
                 });
             }
             Err(_) => {
@@ -352,6 +552,7 @@ fn scan_directory_level(parent: TreeIndex, path: PathBuf, options: ScanOptions) 
                     is_dir: false,
                     entry_count: None,
                     metadata_error: true,
+                    boundary_dev: root_dev,
                 });
             }
         }
@@ -359,9 +560,10 @@ fn scan_directory_level(parent: TreeIndex, path: PathBuf, options: ScanOptions) 
 
     children.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
     stats.total_bytes = Some(children.iter().map(|child| child.size).sum());
-    ScanEvent {
+    ScanEvent::Children {
         parent,
         children,
+        options,
         stats,
     }
 }
@@ -444,6 +646,20 @@ fn summarize_path(
     summary
 }
 
+fn summarize_path_from_fs(path: &Path, root_dev: Option<u64>, options: ScanOptions) -> Summary {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let mut visited = HashSet::new();
+            summarize_path(path, &metadata, root_dev, options, &mut visited)
+        }
+        Err(_) => Summary {
+            io_errors: 1,
+            metadata_error: true,
+            ..Default::default()
+        },
+    }
+}
+
 fn disk_size(metadata: &fs::Metadata, apparent_size: bool) -> u128 {
     if apparent_size {
         metadata.len() as u128
@@ -455,6 +671,29 @@ fn disk_size(metadata: &fs::Metadata, apparent_size: bool) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_until<F>(scan: &mut ActiveScan, mut done: F)
+    where
+        F: FnMut(&ActiveScan) -> bool,
+    {
+        for _ in 0..500 {
+            scan.drain_events(100);
+            if done(scan) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn queued_child_jobs(scan: &ActiveScan, index: TreeIndex) -> usize {
+        scan.queued
+            .iter()
+            .chain(scan.background_queued.iter())
+            .filter(
+                |job| matches!(job, ScanJob::Children(queued_index, _) if *queued_index == index),
+            )
+            .count()
+    }
 
     #[test]
     fn scans_temp_directory_one_level_and_summarizes_children() {
@@ -471,13 +710,7 @@ mod tests {
         )
         .expect("start scan");
 
-        for _ in 0..500 {
-            scan.drain_events(100);
-            if scan.finished {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        wait_until(&mut scan, |scan| scan.finished);
 
         let nested = children(&scan, 0)
             .into_iter()
@@ -486,6 +719,39 @@ mod tests {
         assert!(nested.is_dir);
         assert!(nested.size >= 5);
         assert!(entry_view(&scan, nested.index).is_some());
+    }
+
+    #[test]
+    fn lists_children_before_recursive_summary_finishes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("nested")).expect("create nested");
+        fs::write(dir.path().join("nested/file.txt"), b"hello").expect("write file");
+
+        let mut scan = ActiveScan::start(
+            dir.path().to_path_buf(),
+            ScanOptions {
+                apparent_size: true,
+                cross_filesystems: false,
+            },
+        )
+        .expect("start scan");
+
+        wait_until(&mut scan, |scan| !children(scan, 0).is_empty());
+
+        let nested = children(&scan, 0)
+            .into_iter()
+            .find(|entry| entry.name == "nested")
+            .expect("nested directory listed");
+        assert!(nested.is_dir);
+        assert!(nested.size_pending);
+        assert_eq!(nested.entry_count, None);
+
+        wait_until(&mut scan, |scan| scan.finished);
+
+        let nested = entry_view(&scan, nested.index).expect("nested directory summarized");
+        assert!(!nested.size_pending);
+        assert!(nested.size >= 5);
+        assert!(nested.entry_count.is_some_and(|count| count >= 2));
     }
 
     #[test]
@@ -504,13 +770,7 @@ mod tests {
         )
         .expect("start scan");
 
-        for _ in 0..500 {
-            scan.drain_events(100);
-            if scan.finished {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        wait_until(&mut scan, |scan| !children(scan, 0).is_empty());
 
         scan.prefetch_children(
             0,
@@ -522,5 +782,79 @@ mod tests {
 
         assert!(scan.stats.active_jobs <= MAX_SCAN_JOBS);
         assert!(scan.stats.active_jobs + scan.queued.len() <= MAX_SCAN_JOBS);
+    }
+
+    #[test]
+    fn background_summaries_do_not_fill_interactive_capacity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["a", "b", "c", "d"] {
+            fs::create_dir(dir.path().join(name)).expect("create child dir");
+            fs::write(dir.path().join(name).join("file.txt"), b"hello").expect("write file");
+        }
+
+        let mut scan = ActiveScan::start(
+            dir.path().to_path_buf(),
+            ScanOptions {
+                apparent_size: true,
+                cross_filesystems: false,
+            },
+        )
+        .expect("start scan");
+
+        wait_until(&mut scan, |scan| !children(scan, 0).is_empty());
+
+        assert!(scan.stats.active_jobs <= 1);
+        assert_eq!(scan.queued.len(), 0);
+        assert!(scan.background_queued.len() >= 3);
+
+        let child = children(&scan, 0)
+            .into_iter()
+            .find(|entry| entry.is_dir)
+            .expect("child directory");
+        scan.ensure_scanned(
+            child.index,
+            ScanOptions {
+                apparent_size: true,
+                cross_filesystems: false,
+            },
+        );
+
+        assert_eq!(scan.queued.len(), 0);
+        assert!(scan.nodes[child.index].scanning || scan.nodes[child.index].scanned);
+        assert!(scan.stats.active_jobs <= MAX_SCAN_JOBS);
+    }
+
+    #[test]
+    fn already_scanned_subtree_is_not_rescanned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("nested/child")).expect("create nested child");
+        fs::write(dir.path().join("nested/child/file.txt"), b"hello").expect("write file");
+
+        let options = ScanOptions {
+            apparent_size: true,
+            cross_filesystems: false,
+        };
+        let mut scan = ActiveScan::start(dir.path().to_path_buf(), options).expect("start scan");
+
+        wait_until(&mut scan, |scan| !children(scan, 0).is_empty());
+        let nested = children(&scan, 0)
+            .into_iter()
+            .find(|entry| entry.name == "nested")
+            .expect("nested directory");
+
+        scan.ensure_scanned(nested.index, options);
+        wait_until(&mut scan, |scan| scan.nodes[nested.index].scanned);
+
+        let active_before = scan.stats.active_jobs;
+        let queued_before = scan.queued.len();
+        let background_before = scan.background_queued.len();
+
+        scan.ensure_scanned(nested.index, options);
+        scan.ensure_scanned(nested.index, options);
+
+        assert_eq!(scan.stats.active_jobs, active_before);
+        assert_eq!(scan.queued.len(), queued_before);
+        assert_eq!(scan.background_queued.len(), background_before);
+        assert_eq!(queued_child_jobs(&scan, nested.index), 0);
     }
 }

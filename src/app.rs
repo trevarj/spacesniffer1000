@@ -20,6 +20,9 @@ const STORAGE_PATH_KEY: &str = "spacesniffer1000.path";
 const STORAGE_APPARENT_SIZE_KEY: &str = "spacesniffer1000.apparent_size";
 const STORAGE_CROSS_FILESYSTEMS_KEY: &str = "spacesniffer1000.cross_filesystems";
 const INSPECTOR_CHILD_LIMIT: usize = 80;
+const TILE_HEADER_HEIGHT: f32 = 28.0;
+const MIN_IN_PLACE_SUBDIVIDE_WIDTH: f32 = 180.0;
+const MIN_IN_PLACE_SUBDIVIDE_HEIGHT: f32 = 132.0;
 
 pub struct App {
     path_input: String,
@@ -511,17 +514,18 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let can_go_up = self.can_go_up();
             if toolbar_up_button(ui, can_go_up).clicked() && can_go_up {
                 self.go_up();
             }
 
-            let icon_count = 5.0;
+            let icon_count = 6.0;
             let icon_width = 44.0;
             let icon_spacing = ui.spacing().item_spacing.x;
             let controls_width = icon_count * icon_width + icon_count * icon_spacing;
-            let path_width = (ui.available_width() - controls_width).max(160.0);
+            let path_width = (ui.available_width() - controls_width)
+                .clamp(180.0, ui.available_width().max(180.0));
             let path_response = ui.add_sized(
                 [path_width, 40.0],
                 egui::TextEdit::singleline(&mut self.path_input)
@@ -915,27 +919,22 @@ impl App {
     fn treemap_header(&mut self, ui: &mut egui::Ui, entries: &[EntryView]) {
         ui.vertical(|ui| {
             self.breadcrumbs(ui);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 focus_summary(
                     ui,
                     self.focused_entry(),
                     entries.len(),
                     self.filters_active(),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    size_legend(ui, self.ui_theme);
-                    ui.add_space(10.0);
-                    type_legend(ui);
-                });
+                ui.add_space(12.0);
+                type_legend(ui);
+                ui.add_space(10.0);
+                size_legend(ui, self.ui_theme);
             });
         });
     }
 
     fn treemap(&mut self, ui: &mut egui::Ui, entries: &[EntryView]) {
-        let scan_snapshot = self
-            .scan
-            .as_ref()
-            .map(|scan| (scan.finished, scan.stats.clone()));
         let focused_state = self.focused_directory_state();
         let available = ui.available_size();
         let size = Vec2::new(available.x.max(280.0), available.y.max(300.0));
@@ -969,10 +968,6 @@ impl App {
 
         let max_size = entries.first().map(|entry| entry.size).unwrap_or(1).max(1);
         self.render_entry_tiles(ui, &painter, entries, rect, max_size, 0);
-
-        if let Some((false, stats)) = scan_snapshot {
-            paint_scan_activity_badge(&painter, rect, &stats, self.ui_theme);
-        }
 
         if self.zoom_flash > 0.01 {
             let alpha = (self.zoom_flash * 90.0) as u8;
@@ -1057,6 +1052,13 @@ impl App {
             if is_expanded && !expanded_children.is_empty() {
                 let child_rect = expanded_child_rect(tile_rect, depth);
                 paint_expanded_directory_frame(painter, tile_rect, entry, self.ui_theme);
+                paint_tile_interaction_effects(
+                    painter,
+                    tile_rect,
+                    hover_t,
+                    selected_t,
+                    self.ui_theme,
+                );
                 painter.rect_stroke(tile_rect, 2.0, stroke, StrokeKind::Inside);
                 if glow > 0.0 {
                     painter.rect_stroke(
@@ -1097,6 +1099,7 @@ impl App {
             }
 
             paint_tile_body(painter, tile_rect, color, entry.is_dir, self.ui_theme);
+            paint_tile_interaction_effects(painter, tile_rect, hover_t, selected_t, self.ui_theme);
             painter.rect_stroke(tile_rect, 2.0, stroke, StrokeKind::Inside);
             if glow > 0.0 {
                 painter.rect_stroke(
@@ -1123,7 +1126,7 @@ impl App {
             tile_response.clone().on_hover_ui(|ui| {
                 ui.label(RichText::new(&entry.name).strong());
                 ui.label(entry.path.display().to_string());
-                ui.label(human_bytes(entry.size));
+                ui.label(entry_size_text(entry));
             });
 
             if tile_response.clicked() {
@@ -1137,7 +1140,11 @@ impl App {
                     started_at: time,
                 });
                 if entry.is_dir {
-                    self.expand_directory_tile(entry.index, time);
+                    if should_focus_tile_on_click(tile_rect) {
+                        self.focus_directory(entry.index);
+                    } else {
+                        self.expand_directory_tile(entry.index, time);
+                    }
                 }
             }
 
@@ -1176,11 +1183,15 @@ impl App {
             self.ui_theme,
         );
         info_row(ui, "Path", &entry.path.display().to_string());
-        info_row(ui, "Size", &human_bytes(entry.size));
+        info_row(ui, "Size", &entry_size_text(&entry));
         if let Some(share) = self.selected_parent_share(&entry) {
             info_row(ui, "Parent", &percentage_text(share));
         }
-        info_row(ui, "Entries", &entry.entry_count.unwrap_or(0).to_string());
+        let entries_text = entry
+            .entry_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| String::from("counting"));
+        info_row(ui, "Entries", &entries_text);
         info_row(ui, "Kind", if entry.is_dir { "Folder" } else { "File" });
         if entry.metadata_error {
             ui.colored_label(Color32::YELLOW, "Metadata error");
@@ -1458,6 +1469,14 @@ fn human_bytes(bytes: u128) -> String {
     format_size(bytes.min(u64::MAX as u128) as u64, BINARY)
 }
 
+fn entry_size_text(entry: &EntryView) -> String {
+    if entry.size_pending {
+        String::from("estimating")
+    } else {
+        human_bytes(entry.size)
+    }
+}
+
 fn active_filter_summary(filters: &Filters) -> String {
     let mut count = 0;
     if !filters.name_substring.trim().is_empty() {
@@ -1592,8 +1611,9 @@ fn status_pill(ui: &mut egui::Ui, text: &str, active: bool, dirty_options: bool,
         rect.left_top() + egui::vec2(25.0, 0.0),
         rect.right_bottom() - egui::vec2(10.0, 0.0),
     );
-    ui.painter().with_clip_rect(text_rect).text(
-        text_rect.left_center(),
+    clipped_text(
+        ui.painter(),
+        text_rect,
         Align2::LEFT_CENTER,
         text,
         FontId::proportional(12.0),
@@ -1628,21 +1648,35 @@ fn rescan_pill(ui: &mut egui::Ui, label: &str, theme: UiTheme) -> egui::Response
 }
 
 fn scan_mode_chip(ui: &mut egui::Ui, options: ScanOptions, theme: UiTheme) {
-    filter_chip(ui, &scan_mode_text(options), theme);
+    filter_chip(ui, &scan_mode_text(options), theme).on_hover_text(scan_mode_tooltip(options));
 }
 
 fn scan_mode_text(options: ScanOptions) -> String {
     let size_mode = if options.apparent_size {
-        "Apparent size"
+        "File size"
     } else {
-        "Allocated size"
+        "Disk usage"
     };
     let fs_mode = if options.cross_filesystems {
-        "All filesystems"
+        "includes mounted volumes"
     } else {
-        "Same filesystem"
+        "skips mounted volumes"
     };
-    format!("{size_mode} / {fs_mode}")
+    format!("{size_mode} ({fs_mode})")
+}
+
+fn scan_mode_tooltip(options: ScanOptions) -> String {
+    let size_detail = if options.apparent_size {
+        "File size reports logical bytes, like most file managers."
+    } else {
+        "Disk usage reports allocated blocks, which is closer to real space used."
+    };
+    let fs_detail = if options.cross_filesystems {
+        "Mounted volumes are included while scanning."
+    } else {
+        "Mounted volumes are skipped so scans do not wander into other drives."
+    };
+    format!("{size_detail}\n{fs_detail}")
 }
 
 fn focus_summary(
@@ -1658,7 +1692,7 @@ fn focus_summary(
     let filter_note = if filtered { " filtered" } else { "" };
     let text = format!(
         "{}  |  {} visible{}  |  {}",
-        human_bytes(entry.size),
+        entry_size_text(&entry),
         visible_children,
         filter_note,
         if entry.is_dir { "folder" } else { "file" }
@@ -1684,7 +1718,7 @@ fn paint_pending_badge(painter: &egui::Painter, rect: egui::Rect, theme: UiTheme
     painter.circle_filled(egui::pos2(rect.right() - 9.0, rect.top() + 8.0), 3.5, color);
 }
 
-fn filter_chip(ui: &mut egui::Ui, text: &str, theme: UiTheme) {
+fn filter_chip(ui: &mut egui::Ui, text: &str, theme: UiTheme) -> egui::Response {
     let fill = match theme {
         UiTheme::Graphite => Color32::from_rgb(48, 47, 42),
         UiTheme::Frost => Color32::from_rgb(218, 233, 246),
@@ -1706,12 +1740,13 @@ fn filter_chip(ui: &mut egui::Ui, text: &str, theme: UiTheme) {
         ui.painter()
             .layout_no_wrap(text.to_string(), FontId::proportional(12.0), text_color);
     let size = galley.size() + egui::vec2(16.0, 8.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter().rect_filled(rect, 10.0, fill);
     ui.painter()
         .rect_stroke(rect, 10.0, stroke, StrokeKind::Inside);
     ui.painter()
         .galley(rect.center() - galley.size() * 0.5, galley, text_color);
+    response
 }
 
 fn option_toggle(
@@ -1758,13 +1793,13 @@ fn option_toggle(
         },
     );
 
-    let text_pos = rect.left_center() + egui::vec2(30.0, 0.0);
     let text_clip = egui::Rect::from_min_max(
         rect.left_top() + egui::vec2(29.0, 0.0),
         rect.right_bottom() - egui::vec2(25.0, 0.0),
     );
-    ui.painter().with_clip_rect(text_clip).text(
-        text_pos,
+    clipped_text(
+        ui.painter(),
+        text_clip,
         Align2::LEFT_CENTER,
         label,
         FontId::proportional(12.0),
@@ -1831,8 +1866,9 @@ fn breadcrumb_button(
     ui.painter()
         .rect_stroke(rect, 4.0, stroke, StrokeKind::Inside);
     let clip_rect = rect.shrink2(egui::vec2(9.0, 0.0));
-    ui.painter().with_clip_rect(clip_rect).text(
-        rect.left_center() + egui::vec2(10.0, 0.0),
+    clipped_text(
+        ui.painter(),
+        clip_rect,
         Align2::LEFT_CENTER,
         label,
         FontId::monospace(13.0),
@@ -1890,8 +1926,9 @@ fn mount_row_button(
         rect.left_top() + egui::vec2(44.0, 7.0),
         egui::pos2(text_right, rect.top() + 28.0),
     );
-    ui.painter().with_clip_rect(name_rect).text(
-        name_rect.left_top(),
+    clipped_text(
+        ui.painter(),
+        name_rect,
         Align2::LEFT_TOP,
         &target,
         FontId::monospace(13.0),
@@ -1907,8 +1944,9 @@ fn mount_row_button(
         rect.left_bottom() + egui::vec2(44.0, -19.0),
         egui::pos2(rect.right() - 10.0, rect.bottom() - 4.0),
     );
-    ui.painter().with_clip_rect(detail_rect).text(
-        detail_rect.left_top(),
+    clipped_text(
+        ui.painter(),
+        detail_rect,
         Align2::LEFT_TOP,
         &source,
         FontId::proportional(12.0),
@@ -1938,8 +1976,9 @@ fn paint_mount_fs_badge(
     ui.painter()
         .rect_stroke(rect, 9.0, stroke, StrokeKind::Inside);
     let clip = rect.shrink2(egui::vec2(7.0, 0.0));
-    ui.painter().with_clip_rect(clip).text(
-        rect.center(),
+    clipped_text(
+        ui.painter(),
+        clip,
         Align2::CENTER_CENTER,
         fs_type,
         FontId::monospace(10.5),
@@ -1982,12 +2021,15 @@ fn child_row_button(
         visuals.text_color(),
     );
 
+    let percent_width = 58.0_f32.min(rect.width() * 0.32);
+    let text_right = (rect.right() - percent_width - 10.0).max(rect.left() + 42.0);
     let name_rect = egui::Rect::from_min_max(
         rect.left_top() + egui::vec2(40.0, 7.0),
-        egui::pos2(rect.right() - 78.0, rect.top() + 27.0),
+        egui::pos2(text_right, rect.top() + 27.0),
     );
-    ui.painter().with_clip_rect(name_rect).text(
-        name_rect.left_top(),
+    clipped_text(
+        ui.painter(),
+        name_rect,
         Align2::LEFT_TOP,
         &entry.name,
         FontId::monospace(13.0),
@@ -1996,25 +2038,31 @@ fn child_row_button(
 
     let detail = format!(
         "{}  |  {}",
-        human_bytes(entry.size),
+        entry_size_text(entry),
         if entry.is_dir { "folder" } else { "file" }
     );
     let detail_rect = egui::Rect::from_min_max(
         rect.left_bottom() + egui::vec2(40.0, -18.0),
-        egui::pos2(rect.right() - 78.0, rect.bottom() - 3.0),
+        egui::pos2(text_right, rect.bottom() - 3.0),
     );
-    ui.painter().with_clip_rect(detail_rect).text(
-        detail_rect.left_top(),
+    clipped_text(
+        ui.painter(),
+        detail_rect,
         Align2::LEFT_TOP,
         &detail,
         FontId::proportional(12.0),
         ui.visuals().weak_text_color(),
     );
 
-    ui.painter().text(
-        rect.right_center() - egui::vec2(9.0, 0.0),
+    let percent_rect = egui::Rect::from_min_max(
+        egui::pos2(text_right + 6.0, rect.top()),
+        rect.right_bottom() - egui::vec2(9.0, 0.0),
+    );
+    clipped_text(
+        ui.painter(),
+        percent_rect,
         Align2::RIGHT_CENTER,
-        percentage_text(share),
+        &percentage_text(share),
         FontId::monospace(12.0),
         visuals.text_color(),
     );
@@ -2039,10 +2087,11 @@ fn child_limit_footer(ui: &mut egui::Ui, total: usize, shown: usize, theme: UiTh
         Stroke::new(1.0, themed_effect_color(theme, 75)),
         StrokeKind::Inside,
     );
-    ui.painter().text(
-        rect.left_center() + egui::vec2(10.0, 0.0),
+    clipped_text(
+        ui.painter(),
+        rect.shrink2(egui::vec2(10.0, 0.0)),
         Align2::LEFT_CENTER,
-        text,
+        &text,
         FontId::proportional(12.0),
         ui.visuals().weak_text_color(),
     );
@@ -2079,15 +2128,25 @@ fn action_button(
     ui.painter().rect_filled(rect, 5.0, bg);
     ui.painter()
         .rect_stroke(rect, 5.0, stroke, StrokeKind::Inside);
-    ui.painter().text(
-        rect.left_top() + egui::vec2(10.0, 6.0),
+    let title_rect = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(10.0, 5.0),
+        rect.right_top() + egui::vec2(-10.0, 25.0),
+    );
+    clipped_text(
+        ui.painter(),
+        title_rect,
         Align2::LEFT_TOP,
         title,
         FontId::proportional(15.0),
         title_color,
     );
-    ui.painter().text(
-        rect.left_bottom() + egui::vec2(10.0, -6.0),
+    let detail_rect = egui::Rect::from_min_max(
+        rect.left_bottom() + egui::vec2(10.0, -20.0),
+        rect.right_bottom() - egui::vec2(10.0, 4.0),
+    );
+    clipped_text(
+        ui.painter(),
+        detail_rect,
         Align2::LEFT_BOTTOM,
         detail,
         FontId::proportional(12.0),
@@ -2110,8 +2169,9 @@ fn framed_path(ui: &mut egui::Ui, path: &str) {
     );
 
     let clip_rect = rect.shrink2(egui::vec2(9.0, 0.0));
-    ui.painter().with_clip_rect(clip_rect).text(
-        rect.left_center() + egui::vec2(10.0, 0.0),
+    clipped_text(
+        ui.painter(),
+        clip_rect,
         Align2::LEFT_CENTER,
         path,
         FontId::monospace(13.0),
@@ -2132,8 +2192,9 @@ fn warning_box(ui: &mut egui::Ui, text: &str) {
     );
 
     let clip_rect = rect.shrink2(egui::vec2(10.0, 0.0));
-    ui.painter().with_clip_rect(clip_rect).text(
-        rect.left_center() + egui::vec2(10.0, 0.0),
+    clipped_text(
+        ui.painter(),
+        clip_rect,
         Align2::LEFT_CENTER,
         text,
         FontId::proportional(13.5),
@@ -2177,8 +2238,9 @@ fn confirm_button(
     ui.painter().rect_filled(rect, 5.0, fill);
     ui.painter()
         .rect_stroke(rect, 5.0, stroke, StrokeKind::Inside);
-    ui.painter().text(
-        rect.center(),
+    clipped_text(
+        ui.painter(),
+        rect.shrink2(egui::vec2(10.0, 0.0)),
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(14.0),
@@ -2205,6 +2267,50 @@ fn fit_text_to_width(text: &str, max_width: f32, approximate_char_width: f32) ->
     let keep = max_chars.saturating_sub(3);
     let prefix = text.chars().take(keep).collect::<String>();
     format!("{prefix}...")
+}
+
+#[cfg(test)]
+fn label_fits(rect: egui::Rect, text: &str, font_size: f32, monospace: bool) -> bool {
+    let char_width = if monospace {
+        font_size * 0.62
+    } else {
+        font_size * 0.54
+    };
+    text.chars().count() as f32 * char_width <= rect.width().max(0.0)
+}
+
+fn clipped_text(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    align: Align2,
+    text: &str,
+    font: FontId,
+    color: Color32,
+) {
+    if rect.width() <= 2.0 || rect.height() <= 2.0 {
+        return;
+    }
+    let (clip_rect, pos) = clipped_text_geometry(rect, align);
+    painter
+        .with_clip_rect(clip_rect)
+        .text(pos, align, text, font, color);
+}
+
+fn clipped_text_geometry(rect: egui::Rect, align: Align2) -> (egui::Rect, egui::Pos2) {
+    let clip_rect = match align {
+        Align2::LEFT_TOP => rect.expand2(egui::vec2(0.0, 2.0)),
+        Align2::LEFT_BOTTOM | Align2::RIGHT_BOTTOM => rect.expand2(egui::vec2(0.0, 1.0)),
+        _ => rect,
+    };
+    let pos = match align {
+        Align2::LEFT_TOP => rect.left_top() + egui::vec2(0.0, 1.0),
+        Align2::LEFT_CENTER => rect.left_center(),
+        Align2::RIGHT_CENTER => rect.right_center(),
+        Align2::RIGHT_BOTTOM => rect.right_bottom(),
+        Align2::CENTER_CENTER => rect.center(),
+        _ => rect.left_center(),
+    };
+    (clip_rect, pos)
 }
 
 fn theme_row_button(ui: &mut egui::Ui, theme: UiTheme, selected: bool) -> egui::Response {
@@ -2255,15 +2361,30 @@ fn theme_row_button(ui: &mut egui::Ui, theme: UiTheme, selected: bool) -> egui::
         );
         ui.painter().rect_filled(swatch, 2.0, color);
     }
-    ui.painter().text(
-        rect.left_top() + egui::vec2(94.0, 9.0),
+    let text_right = if selected {
+        rect.right() - 30.0
+    } else {
+        rect.right() - 10.0
+    };
+    let title_rect = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(94.0, 8.0),
+        egui::pos2(text_right, rect.top() + 29.0),
+    );
+    clipped_text(
+        ui.painter(),
+        title_rect,
         Align2::LEFT_TOP,
         theme.label(),
         FontId::proportional(15.0),
         visuals.text_color(),
     );
-    ui.painter().text(
-        rect.left_bottom() + egui::vec2(94.0, -10.0),
+    let detail_rect = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(94.0, 31.0),
+        egui::pos2(text_right, rect.bottom() - 7.0),
+    );
+    clipped_text(
+        ui.painter(),
+        detail_rect,
         Align2::LEFT_BOTTOM,
         theme.description(),
         FontId::proportional(12.0),
@@ -2280,37 +2401,68 @@ fn theme_row_button(ui: &mut egui::Ui, theme: UiTheme, selected: bool) -> egui::
 }
 
 fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    let row_width = ui.available_width();
+    let row_height = if row_width < 190.0 { 42.0 } else { 24.0 };
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::hover());
+        ui.allocate_exact_size(egui::vec2(row_width, row_height), Sense::hover());
     let visuals = ui.visuals();
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
     }
 
-    let label_rect = egui::Rect::from_min_max(
-        rect.left_top() + egui::vec2(2.0, 0.0),
-        egui::pos2(rect.left() + 66.0, rect.bottom()),
-    );
-    ui.painter().text(
-        label_rect.left_center(),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(12.0),
-        visuals.weak_text_color(),
-    );
+    if row_width < 190.0 {
+        let label_rect = egui::Rect::from_min_max(
+            rect.left_top() + egui::vec2(2.0, 2.0),
+            egui::pos2(rect.right() - 2.0, rect.top() + 18.0),
+        );
+        clipped_text(
+            ui.painter(),
+            label_rect,
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(11.5),
+            visuals.weak_text_color(),
+        );
+        let value_rect = egui::Rect::from_min_max(
+            rect.left_top() + egui::vec2(2.0, 19.0),
+            rect.right_bottom() - egui::vec2(2.0, 1.0),
+        );
+        clipped_text(
+            ui.painter(),
+            value_rect,
+            Align2::LEFT_CENTER,
+            value,
+            FontId::monospace(12.0),
+            visuals.text_color(),
+        );
+    } else {
+        let label_rect = egui::Rect::from_min_max(
+            rect.left_top() + egui::vec2(2.0, 0.0),
+            egui::pos2(rect.left() + 66.0, rect.bottom()),
+        );
+        clipped_text(
+            ui.painter(),
+            label_rect,
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(12.0),
+            visuals.weak_text_color(),
+        );
 
-    let value_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 72.0, rect.top()),
-        rect.right_bottom() - egui::vec2(2.0, 0.0),
-    );
-    ui.painter().with_clip_rect(value_rect).text(
-        value_rect.left_center(),
-        Align2::LEFT_CENTER,
-        value,
-        FontId::monospace(12.5),
-        visuals.text_color(),
-    );
+        let value_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 72.0, rect.top()),
+            rect.right_bottom() - egui::vec2(2.0, 0.0),
+        );
+        clipped_text(
+            ui.painter(),
+            value_rect,
+            Align2::LEFT_CENTER,
+            value,
+            FontId::monospace(12.5),
+            visuals.text_color(),
+        );
+    }
     let _ = response.on_hover_text(value);
 }
 
@@ -2351,8 +2503,9 @@ fn inspector_note(ui: &mut egui::Ui, text: &str, loading: bool, theme: UiTheme) 
         rect.left_top() + egui::vec2(30.0, 0.0),
         rect.right_bottom() - egui::vec2(8.0, 0.0),
     );
-    ui.painter().with_clip_rect(text_rect).text(
-        text_rect.left_center(),
+    clipped_text(
+        ui.painter(),
+        text_rect,
         Align2::LEFT_CENTER,
         text,
         FontId::proportional(13.0),
@@ -2394,8 +2547,9 @@ fn selected_summary_card(
         rect.left_top() + egui::vec2(52.0, 10.0),
         egui::pos2(rect.right() - 10.0, rect.top() + 34.0),
     );
-    ui.painter().with_clip_rect(title_clip).text(
-        title_clip.left_top(),
+    clipped_text(
+        ui.painter(),
+        title_clip,
         Align2::LEFT_TOP,
         &entry.name,
         FontId::monospace(15.0),
@@ -2406,13 +2560,14 @@ fn selected_summary_card(
     let share = parent_share
         .map(|share| format!("{} of parent", percentage_text(share)))
         .unwrap_or_else(|| "parent share unavailable".to_string());
-    let detail = format!("{}  |  {}  |  {}", human_bytes(entry.size), kind, share);
+    let detail = format!("{}  |  {}  |  {}", entry_size_text(entry), kind, share);
     let detail_clip = egui::Rect::from_min_max(
         rect.left_top() + egui::vec2(52.0, 38.0),
         egui::pos2(rect.right() - 10.0, rect.top() + 60.0),
     );
-    ui.painter().with_clip_rect(detail_clip).text(
-        detail_clip.left_top(),
+    clipped_text(
+        ui.painter(),
+        detail_clip,
         Align2::LEFT_TOP,
         &detail,
         FontId::proportional(13.0),
@@ -2595,51 +2750,6 @@ fn paint_treemap_empty_state(
     );
 }
 
-fn paint_scan_activity_badge(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    stats: &scan::ScanStats,
-    theme: UiTheme,
-) {
-    let text = format!(
-        "scanning  {} entries  {} jobs",
-        stats.entries_traversed, stats.active_jobs
-    );
-    let width = (text.chars().count() as f32 * 7.2 + 24.0).clamp(168.0, 260.0);
-    let badge = egui::Rect::from_min_size(
-        rect.left_top() + egui::vec2(12.0, 12.0),
-        egui::vec2(width, 30.0),
-    );
-    let bg = match theme {
-        UiTheme::Frost => Color32::from_rgba_unmultiplied(245, 248, 252, 224),
-        UiTheme::Graphite => Color32::from_rgba_unmultiplied(23, 24, 27, 224),
-        UiTheme::Retrowave => Color32::from_rgba_unmultiplied(12, 7, 30, 224),
-    };
-    let fg = match theme {
-        UiTheme::Frost => Color32::from_rgb(36, 78, 112),
-        UiTheme::Graphite | UiTheme::Retrowave => Color32::from_rgb(232, 238, 246),
-    };
-    painter.rect_filled(badge, 5.0, bg);
-    painter.rect_stroke(
-        badge,
-        5.0,
-        Stroke::new(1.0, themed_effect_color(theme, 110)),
-        StrokeKind::Inside,
-    );
-    painter.circle_filled(
-        badge.left_center() + egui::vec2(12.0, 0.0),
-        4.0,
-        themed_effect_color(theme, 210),
-    );
-    painter.text(
-        badge.left_center() + egui::vec2(22.0, 0.0),
-        Align2::LEFT_CENTER,
-        text,
-        FontId::monospace(12.0),
-        fg,
-    );
-}
-
 fn paint_tree_background(painter: &egui::Painter, rect: egui::Rect, time: f64, theme: UiTheme) {
     let (fill, line, accent) = match theme {
         UiTheme::Graphite => (
@@ -2706,20 +2816,30 @@ fn paint_tile_body(
         painter.rect_filled(rect, 2.0, color);
         let header = egui::Rect::from_min_max(
             rect.left_top(),
-            egui::pos2(rect.right(), (rect.top() + 20.0).min(rect.bottom())),
+            egui::pos2(
+                rect.right(),
+                (rect.top() + TILE_HEADER_HEIGHT).min(rect.bottom()),
+            ),
         );
         painter.rect_filled(header, 2.0, overlay_color(theme, 54));
-        if rect.width() > 42.0 && rect.height() > 28.0 {
+        painter.line_segment(
+            [
+                egui::pos2(header.left(), header.bottom()),
+                egui::pos2(header.right(), header.bottom()),
+            ],
+            Stroke::new(1.0, color_with_alpha(foreground, 42)),
+        );
+        if rect.width() > 54.0 && rect.height() > 34.0 {
             let tab = egui::Rect::from_min_size(
-                rect.left_top() + egui::vec2(7.0, 3.0),
-                egui::vec2((rect.width() * 0.16).clamp(16.0, 42.0), 4.0),
+                rect.left_top() + egui::vec2(9.0, 5.0),
+                egui::vec2((rect.width() * 0.14).clamp(16.0, 42.0), 4.0),
             );
             painter.rect_filled(tab, 1.0, color_with_alpha(foreground, 105));
             paint_symbolic_icon(
                 painter,
                 egui::Rect::from_min_size(
-                    rect.left_top() + egui::vec2(9.0, 8.0),
-                    Vec2::splat(14.0),
+                    rect.left_top() + egui::vec2(10.0, 11.0),
+                    Vec2::splat(13.0),
                 ),
                 IconKind::Folder,
                 color_with_alpha(foreground, 190),
@@ -2755,58 +2875,115 @@ fn paint_tile_label(painter: &egui::Painter, rect: egui::Rect, entry: &EntryView
     }
 
     let text_color = tile_foreground_color(color);
-    let icon_offset = if entry.is_dir { 31.0 } else { 30.0 };
-    let can_show_name = rect.width() > 74.0 && rect.height() > 34.0;
-    let can_show_size = rect.width() > 92.0 && rect.height() > 50.0;
+    let Some(layout) = tile_label_layout(rect, entry) else {
+        return;
+    };
     let detailed = rect.width() > 168.0 && rect.height() > 78.0;
 
-    if can_show_name {
-        let font_size = if detailed {
-            15.0
-        } else if rect.width() > 120.0 {
-            13.5
-        } else {
-            12.0
-        };
-        let label_clip = egui::Rect::from_min_max(
-            rect.left_top() + egui::vec2(icon_offset, 7.0),
-            egui::pos2(rect.right() - 6.0, rect.top() + 25.0),
-        );
-        painter.with_clip_rect(label_clip).text(
-            rect.left_top() + egui::vec2(icon_offset, 7.0),
-            Align2::LEFT_TOP,
-            &entry.name,
-            FontId::monospace(font_size),
-            text_color,
-        );
-    }
+    let fitted_name = fit_text_to_width(
+        &entry.name,
+        layout.name_rect.width(),
+        layout.name_char_width,
+    );
+    clipped_text(
+        painter,
+        layout.name_rect,
+        Align2::LEFT_CENTER,
+        &fitted_name,
+        FontId::monospace(layout.name_font_size),
+        text_color,
+    );
 
-    if can_show_size {
-        let size_text = human_bytes(entry.size);
-        let fitted_size = fit_text_to_width(&size_text, (rect.width() - 16.0).max(12.0), 7.0);
-        painter.text(
-            rect.left_bottom() + egui::vec2(8.0, -7.0),
-            Align2::LEFT_BOTTOM,
-            fitted_size,
+    if let Some(size_rect) = layout.size_rect {
+        let size_text = entry_size_text(entry);
+        let fitted_size = fit_text_to_width(&size_text, size_rect.width(), 7.0);
+        clipped_text(
+            painter,
+            size_rect,
+            Align2::LEFT_CENTER,
+            &fitted_size,
             FontId::monospace(if detailed { 13.0 } else { 11.5 }),
             color_with_alpha(text_color, 220),
         );
     }
 
-    if detailed && entry.is_dir {
+    if let Some(count_rect) = layout.count_rect {
         let count = entry
             .entry_count
             .map(|count| format!("{count} entries"))
-            .unwrap_or_else(|| String::from("not scanned"));
-        let fitted_count = fit_text_to_width(&count, (rect.width() - 16.0).max(12.0), 6.5);
-        painter.text(
-            rect.left_top() + egui::vec2(8.0, 31.0),
+            .unwrap_or_else(|| String::from("counting"));
+        let fitted_count = fit_text_to_width(&count, count_rect.width(), 6.5);
+        clipped_text(
+            painter,
+            count_rect,
             Align2::LEFT_TOP,
-            fitted_count,
+            &fitted_count,
             FontId::proportional(12.0),
             color_with_alpha(text_color, 185),
         );
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TileLabelLayout {
+    name_rect: egui::Rect,
+    size_rect: Option<egui::Rect>,
+    count_rect: Option<egui::Rect>,
+    name_font_size: f32,
+    name_char_width: f32,
+}
+
+fn tile_label_layout(rect: egui::Rect, entry: &EntryView) -> Option<TileLabelLayout> {
+    if rect.width() < 76.0 || rect.height() < 36.0 {
+        return None;
+    }
+
+    let detailed = rect.width() > 168.0 && rect.height() > 78.0;
+    let name_font_size = if detailed {
+        15.0
+    } else if rect.width() > 120.0 {
+        13.5
+    } else {
+        12.0
+    };
+    let name_char_width = name_font_size * 0.62;
+    let left = if entry.is_dir { 31.0 } else { 30.0 };
+    let top = if entry.is_dir { 6.0 } else { 8.0 };
+    let name_rect = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(left, top),
+        egui::pos2(
+            rect.right() - 7.0,
+            rect.top() + if entry.is_dir { 25.0 } else { 28.0 },
+        ),
+    );
+    if name_rect.width() < 20.0 || name_rect.height() < 12.0 {
+        return None;
+    }
+
+    let size_rect = (rect.width() > 92.0 && rect.height() > 52.0).then(|| {
+        egui::Rect::from_min_max(
+            rect.left_bottom() + egui::vec2(8.0, -30.0),
+            rect.right_bottom() - egui::vec2(8.0, 10.0),
+        )
+    });
+    let count_rect = (detailed && entry.is_dir).then(|| {
+        egui::Rect::from_min_max(
+            rect.left_top() + egui::vec2(8.0, TILE_HEADER_HEIGHT + 7.0),
+            egui::pos2(rect.right() - 8.0, rect.top() + TILE_HEADER_HEIGHT + 24.0),
+        )
+    });
+
+    Some(TileLabelLayout {
+        name_rect,
+        size_rect,
+        count_rect,
+        name_font_size,
+        name_char_width,
+    })
+}
+
+fn should_focus_tile_on_click(rect: egui::Rect) -> bool {
+    rect.width() < MIN_IN_PLACE_SUBDIVIDE_WIDTH || rect.height() < MIN_IN_PLACE_SUBDIVIDE_HEIGHT
 }
 
 fn expanded_child_rect(rect: egui::Rect, depth: usize) -> egui::Rect {
@@ -2855,22 +3032,32 @@ fn paint_expanded_directory_frame(
             color_with_alpha(foreground, 205),
         );
 
-        painter
-            .with_clip_rect(header.shrink2(egui::vec2(28.0, 0.0)))
-            .text(
-                header.left_center() + egui::vec2(29.0, 0.0),
-                Align2::LEFT_CENTER,
-                &entry.name,
-                FontId::monospace(13.0),
-                foreground,
-            );
+        let size = entry_size_text(entry);
+        let size_width = (size.chars().count() as f32 * 7.2 + 8.0).clamp(50.0, 92.0);
+        let size_rect = egui::Rect::from_min_max(
+            egui::pos2(header.right() - size_width - 8.0, header.top()),
+            header.right_bottom() - egui::vec2(8.0, 0.0),
+        );
+        let name_rect = egui::Rect::from_min_max(
+            egui::pos2(header.left() + 29.0, header.top()),
+            egui::pos2(size_rect.left() - 8.0, header.bottom()),
+        );
+        let fitted_name = fit_text_to_width(&entry.name, name_rect.width(), 7.8);
+        clipped_text(
+            painter,
+            name_rect,
+            Align2::LEFT_CENTER,
+            &fitted_name,
+            FontId::monospace(13.0),
+            foreground,
+        );
 
-        let size = human_bytes(entry.size);
-        let fitted_size = fit_text_to_width(&size, 72.0, 7.2);
-        painter.text(
-            header.right_center() - egui::vec2(8.0, 0.0),
+        let fitted_size = fit_text_to_width(&size, size_rect.width(), 7.2);
+        clipped_text(
+            painter,
+            size_rect,
             Align2::RIGHT_CENTER,
-            fitted_size,
+            &fitted_size,
             FontId::monospace(12.0),
             color_with_alpha(foreground, 190),
         );
@@ -2897,6 +3084,41 @@ fn paint_selected_breathing(painter: &egui::Painter, rect: egui::Rect, _time: f6
         5.0,
         Stroke::new(2.0, themed_effect_color(theme, 96)),
         StrokeKind::Outside,
+    );
+}
+
+fn paint_tile_interaction_effects(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    hover_t: f32,
+    selected_t: f32,
+    theme: UiTheme,
+) {
+    let t = hover_t.max(selected_t * 0.65).clamp(0.0, 1.0);
+    if t <= 0.01 || rect.width() < 10.0 || rect.height() < 10.0 {
+        return;
+    }
+
+    let clip = painter.with_clip_rect(rect.shrink(1.0));
+    let glass_alpha = (t * 34.0) as u8;
+    let glow_alpha = (t * 92.0) as u8;
+    let sheen = match theme {
+        UiTheme::Frost => Color32::from_rgba_unmultiplied(255, 255, 255, glass_alpha),
+        UiTheme::Graphite | UiTheme::Retrowave => {
+            Color32::from_rgba_unmultiplied(255, 255, 255, glass_alpha)
+        }
+    };
+    let upper = egui::Rect::from_min_max(
+        rect.left_top(),
+        egui::pos2(rect.right(), rect.top() + rect.height() * 0.44),
+    );
+    clip.rect_filled(upper, 2.0, sheen);
+
+    painter.rect_stroke(
+        rect.shrink(1.0),
+        4.0,
+        Stroke::new(1.0 + t, themed_effect_color(theme, glow_alpha)),
+        StrokeKind::Inside,
     );
 }
 
@@ -3199,6 +3421,20 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 mod tests {
     use super::*;
 
+    fn test_entry(name: &str, is_dir: bool) -> EntryView {
+        EntryView {
+            index: 1,
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            size: 1024,
+            modified: SystemTime::UNIX_EPOCH,
+            is_dir,
+            entry_count: Some(3),
+            metadata_error: false,
+            size_pending: false,
+        }
+    }
+
     #[test]
     fn summarizes_active_filters() {
         assert_eq!(
@@ -3220,5 +3456,102 @@ mod tests {
             }),
             "3 active filters"
         );
+    }
+
+    #[test]
+    fn scan_mode_copy_uses_user_facing_terms() {
+        assert_eq!(
+            scan_mode_text(ScanOptions {
+                apparent_size: false,
+                cross_filesystems: false,
+            }),
+            "Disk usage (skips mounted volumes)"
+        );
+        assert_eq!(
+            scan_mode_text(ScanOptions {
+                apparent_size: true,
+                cross_filesystems: true,
+            }),
+            "File size (includes mounted volumes)"
+        );
+        assert!(scan_mode_tooltip(ScanOptions::default()).contains("allocated blocks"));
+    }
+
+    #[test]
+    fn tile_label_layout_keeps_text_below_header_divider() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(180.0, 90.0));
+        let entry = test_entry("very-long-directory-name-that-must-fit", true);
+        let layout = tile_label_layout(rect, &entry).expect("tile label layout");
+
+        assert!(layout.name_rect.bottom() <= TILE_HEADER_HEIGHT);
+        assert!(layout.name_rect.left() >= rect.left() + 31.0);
+        assert!(
+            layout
+                .count_rect
+                .is_some_and(|count| count.top() >= TILE_HEADER_HEIGHT)
+        );
+        assert!(
+            layout
+                .size_rect
+                .is_none_or(|size| !size.intersects(layout.name_rect))
+        );
+        assert!(
+            layout
+                .count_rect
+                .is_none_or(|count| !count.intersects(layout.name_rect))
+        );
+        assert!(
+            layout
+                .size_rect
+                .is_some_and(|size| size.bottom() <= rect.bottom() - 10.0)
+        );
+    }
+
+    #[test]
+    fn tile_label_layout_hides_text_before_it_overlaps() {
+        let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(58.0, 30.0));
+        assert!(tile_label_layout(tiny, &test_entry("src", true)).is_none());
+
+        let compact = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(94.0, 42.0));
+        let layout = tile_label_layout(compact, &test_entry("src", true)).expect("compact label");
+        assert!(layout.size_rect.is_none());
+        assert!(layout.count_rect.is_none());
+        assert!(label_fits(
+            layout.name_rect,
+            "src",
+            layout.name_font_size,
+            true
+        ));
+    }
+
+    #[test]
+    fn clipped_top_aligned_text_has_ascender_bleed() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(80.0, 18.0));
+        let (clip_rect, pos) = clipped_text_geometry(rect, Align2::LEFT_TOP);
+
+        assert!(clip_rect.top() < rect.top());
+        assert!(clip_rect.bottom() > rect.bottom());
+        assert!(pos.y > rect.top());
+        assert!(pos.y < rect.center().y);
+    }
+
+    #[test]
+    fn small_tiles_focus_instead_of_subdividing_in_place() {
+        let narrow = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(MIN_IN_PLACE_SUBDIVIDE_WIDTH - 1.0, 240.0),
+        );
+        let short = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(260.0, MIN_IN_PLACE_SUBDIVIDE_HEIGHT - 1.0),
+        );
+        let readable = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(MIN_IN_PLACE_SUBDIVIDE_WIDTH, MIN_IN_PLACE_SUBDIVIDE_HEIGHT),
+        );
+
+        assert!(should_focus_tile_on_click(narrow));
+        assert!(should_focus_tile_on_click(short));
+        assert!(!should_focus_tile_on_click(readable));
     }
 }
