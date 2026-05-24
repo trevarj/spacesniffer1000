@@ -7,7 +7,7 @@ Native graphical disk space visualizer inspired by SpaceSniffer.
 ## Run
 
 ```sh
-guix shell -m manifest.scm -- cargo run
+guix shell -m manifest.scm -- cargo run --bin ss1000
 ```
 
 Enter a path or choose a mounted filesystem, then press `Scan`. Click treemap rectangles to zoom into directories. Use breadcrumbs or `Up` to navigate back.
@@ -25,6 +25,8 @@ Permanent delete is irreversible and requires typing the exact selected path.
 ```sh
 guix shell -m manifest.scm -- cargo build --release
 ```
+
+The release binary is `target/release/ss1000`.
 
 The Guix package entry is `guix.scm`. It documents the remaining crate-vendoring step needed for fully offline Guix package builds.
 

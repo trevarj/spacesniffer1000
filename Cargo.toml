@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 description = "Native graphical disk space visualizer inspired by SpaceSniffer."
 
+[[bin]]
+name = "ss1000"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0"
 crossbeam = "0.8"
