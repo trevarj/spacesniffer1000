@@ -1,0 +1,18 @@
+[package]
+name = "spacesniffer1000"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native graphical disk space visualizer inspired by SpaceSniffer."
+
+[dependencies]
+anyhow = "1.0"
+crossbeam = "0.8"
+eframe = { version = "0.34.2", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
+egui = "0.34.2"
+humansize = "2.1"
+rfd = { version = "0.15.4", default-features = false, features = ["tokio", "xdg-portal"] }
+trash = "5.2"
+
+[dev-dependencies]
+tempfile = "3.14"

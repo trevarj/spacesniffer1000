@@ -1,0 +1,7 @@
+/target/
+/result
+/result-*
+/.codex/
+/.agents/
+*.tmp
+*.log
