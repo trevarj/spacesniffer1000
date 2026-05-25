@@ -4,6 +4,7 @@ fn main() -> eframe::Result<()> {
             .with_app_id("spacesniffer1000")
             .with_title("SpaceSniffer1000")
             .with_inner_size([1280.0, 820.0]),
+        persist_window: true,
         ..Default::default()
     };
 

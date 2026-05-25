@@ -167,6 +167,9 @@ impl App {
     }
 
     fn start_scan(&mut self) {
+        if let Some(scan) = self.scan.as_mut() {
+            scan.cancel();
+        }
         let path = PathBuf::from(self.path_input.trim());
         let options = self.scan_options();
         match ActiveScan::start(path.clone(), options) {
@@ -185,6 +188,16 @@ impl App {
             Err(err) => {
                 self.status = format!("Scan failed: {err}");
             }
+        }
+    }
+
+    fn cancel_scan(&mut self) {
+        if let Some(scan) = self.scan.as_mut() {
+            scan.cancel();
+            self.status = format!(
+                "Canceled scan after {} entries.",
+                scan.stats.entries_traversed
+            );
         }
     }
 
@@ -429,7 +442,12 @@ impl App {
             return;
         };
         let changed = scan.drain_events(250);
-        if scan.finished {
+        if scan.canceled {
+            self.status = format!(
+                "Canceled scan after {} entries.",
+                scan.stats.entries_traversed
+            );
+        } else if scan.finished {
             self.status = format!(
                 "{} entries, {}, {} I/O errors",
                 scan.stats.entries_traversed,
@@ -440,7 +458,14 @@ impl App {
                 scan.stats.io_errors
             );
         } else {
-            self.status = format!("Scanning {} entries...", scan.stats.entries_traversed);
+            let progress = scan.progress();
+            self.status = format!(
+                "Scanning {} entries... {} active, {} queued, {} estimating",
+                progress.entries_traversed,
+                progress.active_jobs,
+                progress.queued_jobs,
+                progress.background_jobs
+            );
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         if changed {
@@ -553,7 +578,11 @@ impl App {
                 self.start_scan();
             }
             let path_dirty = self.path_dirty();
-            let refresh_response = icon_button(ui, IconKind::Refresh, "Scan / rescan (F5)");
+            let refresh_response = icon_button(
+                ui,
+                IconKind::Refresh,
+                "Fresh scan from disk (F5). Clears the current in-memory scan tree.",
+            );
             if path_dirty {
                 paint_toolbar_badge(ui.painter(), refresh_response.rect, self.ui_theme);
             }
@@ -591,6 +620,13 @@ impl App {
             };
             let pending_scan = dirty_options || path_dirty;
             status_pill(ui, status_text, scanning, pending_scan, self.ui_theme);
+            if scanning
+                && text_button(ui, "Cancel", egui::vec2(78.0, 26.0), true)
+                    .on_hover_text("Stop accepting results from the current scan.")
+                    .clicked()
+            {
+                self.cancel_scan();
+            }
             if pending_scan
                 && rescan_pill(
                     ui,
@@ -1002,7 +1038,7 @@ impl App {
                 .iter()
                 .map(|entry| TreemapItem {
                     item: entry.index,
-                    size: entry.size,
+                    size: entry.layout_size,
                 })
                 .collect::<Vec<_>>(),
             rect,
@@ -1032,8 +1068,19 @@ impl App {
             let selected_t = ui
                 .ctx()
                 .animate_bool(id.with("selected"), selected == Some(entry.index));
-            let color = size_color(entry.size, max_size, self.ui_theme);
+            let color = if entry.size_pending {
+                pending_tile_color(self.ui_theme)
+            } else {
+                size_color(entry.size, max_size, self.ui_theme)
+            };
             let glow = (hover_t + selected_t).clamp(0.0, 1.0);
+            let directory_state = if entry.is_dir {
+                self.scan
+                    .as_ref()
+                    .and_then(|scan| scan::directory_scan_state(scan, entry.index))
+            } else {
+                None
+            };
             let is_expanded = self.expanded.contains(&entry.index);
             let expanded_children = if is_expanded {
                 self.filtered_children(entry.index)
@@ -1122,11 +1169,15 @@ impl App {
             );
 
             paint_tile_label(painter, tile_rect, entry, color);
+            paint_tile_scan_badge(painter, tile_rect, directory_state, entry.size_pending);
 
             tile_response.clone().on_hover_ui(|ui| {
                 ui.label(RichText::new(&entry.name).strong());
                 ui.label(entry.path.display().to_string());
                 ui.label(entry_size_text(entry));
+                if let Some(state) = directory_state {
+                    ui.label(RichText::new(directory_state_text(state)).small().weak());
+                }
             });
 
             if tile_response.clicked() {
@@ -1194,7 +1245,10 @@ impl App {
         info_row(ui, "Entries", &entries_text);
         info_row(ui, "Kind", if entry.is_dir { "Folder" } else { "File" });
         if entry.metadata_error {
-            ui.colored_label(Color32::YELLOW, "Metadata error");
+            ui.colored_label(
+                Color32::YELLOW,
+                "Some metadata could not be read for this path.",
+            );
         }
 
         if entry.is_dir {
@@ -1206,7 +1260,7 @@ impl App {
             if action_button(
                 ui,
                 "Subdivide",
-                "Show children inside the current tile",
+                "Show children here; cached after loading",
                 false,
             )
             .on_hover_text("Enter")
@@ -1274,7 +1328,39 @@ impl App {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(8.0);
+        if self.scan_warning_summary(ui) {
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+        }
         self.focused_child_list(ui, &focused_children);
+    }
+
+    fn scan_warning_summary(&self, ui: &mut egui::Ui) -> bool {
+        let Some(scan) = self.scan.as_ref() else {
+            return false;
+        };
+        if scan.stats.io_errors == 0 {
+            return false;
+        }
+
+        ui.label(RichText::new("Scan Warnings").strong());
+        ui.colored_label(
+            Color32::YELLOW,
+            format!(
+                "{} filesystem entries could not be read.",
+                scan.stats.io_errors
+            ),
+        );
+        for sample in scan.stats.error_samples.iter().take(4) {
+            ui.label(
+                RichText::new(format!("{}: {}", sample.path.display(), sample.message))
+                    .small()
+                    .monospace()
+                    .weak(),
+            );
+        }
+        true
     }
 
     fn focused_child_list(&mut self, ui: &mut egui::Ui, children: &[EntryView]) {
@@ -1474,6 +1560,15 @@ fn entry_size_text(entry: &EntryView) -> String {
         String::from("estimating")
     } else {
         human_bytes(entry.size)
+    }
+}
+
+fn directory_state_text(state: scan::DirectoryScanState) -> &'static str {
+    match state {
+        scan::DirectoryScanState::NotDirectory => "file",
+        scan::DirectoryScanState::Pending => "children not loaded yet",
+        scan::DirectoryScanState::Scanning => "loading children",
+        scan::DirectoryScanState::Scanned => "children cached in this session",
     }
 }
 
@@ -2908,6 +3003,52 @@ fn paint_tile_label(painter: &egui::Painter, rect: egui::Rect, entry: &EntryView
     }
 }
 
+fn paint_tile_scan_badge(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    state: Option<scan::DirectoryScanState>,
+    size_pending: bool,
+) {
+    let Some(state) = state else {
+        return;
+    };
+    let text = match state {
+        scan::DirectoryScanState::Pending => Some("click to load"),
+        scan::DirectoryScanState::Scanning => Some("loading"),
+        scan::DirectoryScanState::Scanned if size_pending => Some("estimating"),
+        _ => None,
+    };
+    let Some(text) = text else {
+        return;
+    };
+    if rect.width() < 104.0 || rect.height() < 52.0 {
+        return;
+    }
+
+    let badge = egui::Rect::from_min_size(
+        rect.left_bottom() + egui::vec2(8.0, -28.0),
+        egui::vec2(
+            (text.len() as f32 * 7.0 + 18.0).min(rect.width() - 16.0),
+            20.0,
+        ),
+    );
+    painter.rect_filled(badge, 10.0, Color32::from_black_alpha(92));
+    painter.rect_stroke(
+        badge,
+        10.0,
+        Stroke::new(1.0, Color32::from_white_alpha(76)),
+        StrokeKind::Inside,
+    );
+    clipped_text(
+        painter,
+        badge.shrink2(egui::vec2(8.0, 0.0)),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(11.0),
+        Color32::from_white_alpha(210),
+    );
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TileLabelLayout {
     name_rect: egui::Rect,
@@ -3395,6 +3536,14 @@ fn size_color(size: u128, max_size: u128, theme: UiTheme) -> Color32 {
     }
 }
 
+fn pending_tile_color(theme: UiTheme) -> Color32 {
+    match theme {
+        UiTheme::Graphite => Color32::from_rgb(74, 79, 88),
+        UiTheme::Frost => Color32::from_rgb(188, 198, 210),
+        UiTheme::Retrowave => Color32::from_rgb(70, 54, 104),
+    }
+}
+
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
@@ -3411,6 +3560,7 @@ mod tests {
             name: name.to_string(),
             path: PathBuf::from(name),
             size: 1024,
+            layout_size: 1024,
             modified: SystemTime::UNIX_EPOCH,
             is_dir,
             entry_count: Some(3),
@@ -3459,6 +3609,22 @@ mod tests {
             "File size (includes mounted volumes)"
         );
         assert!(scan_mode_tooltip(ScanOptions::default()).contains("allocated blocks"));
+    }
+
+    #[test]
+    fn directory_state_copy_explains_lazy_loading_and_cache() {
+        assert_eq!(
+            directory_state_text(scan::DirectoryScanState::Pending),
+            "children not loaded yet"
+        );
+        assert_eq!(
+            directory_state_text(scan::DirectoryScanState::Scanning),
+            "loading children"
+        );
+        assert_eq!(
+            directory_state_text(scan::DirectoryScanState::Scanned),
+            "children cached in this session"
+        );
     }
 
     #[test]

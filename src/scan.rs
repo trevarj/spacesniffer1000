@@ -5,21 +5,28 @@ use std::{
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::SystemTime,
 };
 
 pub type TreeIndex = usize;
 const MAX_SCAN_JOBS: usize = 2;
+const PROVISIONAL_PENDING_LAYOUT_SIZE: u128 = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct ActiveScan {
     nodes: Vec<Node>,
     event_rx: Receiver<ScanEvent>,
     event_tx: Sender<ScanEvent>,
+    cancel_flag: Arc<AtomicBool>,
     queued: VecDeque<ScanJob>,
     background_queued: VecDeque<ScanJob>,
     pub root: PathBuf,
     pub finished: bool,
+    pub canceled: bool,
     pub stats: ScanStats,
 }
 
@@ -35,6 +42,24 @@ pub struct ScanStats {
     pub io_errors: u64,
     pub total_bytes: Option<u128>,
     pub active_jobs: usize,
+    pub error_samples: Vec<IoErrorSample>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IoErrorSample {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanProgress {
+    pub active_jobs: usize,
+    pub queued_jobs: usize,
+    pub background_jobs: usize,
+    pub entries_traversed: u64,
+    pub io_errors: u64,
+    pub finished: bool,
+    pub canceled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +124,7 @@ pub struct EntryView {
     pub name: String,
     pub path: PathBuf,
     pub size: u128,
+    pub layout_size: u128,
     pub modified: SystemTime,
     pub is_dir: bool,
     pub entry_count: Option<u64>,
@@ -141,10 +167,12 @@ impl ActiveScan {
             nodes: vec![root_node],
             event_rx,
             event_tx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
             queued: VecDeque::new(),
             background_queued: VecDeque::new(),
             root,
             finished: false,
+            canceled: false,
             stats: ScanStats::default(),
         };
         scan.scan_children(0, options);
@@ -152,6 +180,12 @@ impl ActiveScan {
     }
 
     pub fn drain_events(&mut self, limit: usize) -> bool {
+        if self.canceled {
+            while self.event_rx.try_recv().is_ok() {}
+            self.finished = true;
+            return false;
+        }
+
         let mut changed = false;
         for _ in 0..limit {
             let Ok(event) = self.event_rx.try_recv() else {
@@ -168,6 +202,31 @@ impl ActiveScan {
             self.mark_completed_summary_flags();
         }
         changed
+    }
+
+    pub fn cancel(&mut self) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+        self.queued.clear();
+        self.background_queued.clear();
+        for node in &mut self.nodes {
+            node.scanning = false;
+            node.summarizing = false;
+        }
+        self.stats.active_jobs = 0;
+        self.finished = true;
+        self.canceled = true;
+    }
+
+    pub fn progress(&self) -> ScanProgress {
+        ScanProgress {
+            active_jobs: self.stats.active_jobs,
+            queued_jobs: self.queued.len(),
+            background_jobs: self.background_queued.len(),
+            entries_traversed: self.stats.entries_traversed,
+            io_errors: self.stats.io_errors,
+            finished: self.finished,
+            canceled: self.canceled,
+        }
     }
 
     pub fn ensure_scanned(&mut self, index: TreeIndex, options: ScanOptions) {
@@ -283,11 +342,12 @@ impl ActiveScan {
         self.stats.active_jobs += 1;
         let path = node.path.clone();
         let tx = self.event_tx.clone();
+        let cancel_flag = self.cancel_flag.clone();
 
         std::thread::Builder::new()
             .name("spacesniffer-level-scan".into())
             .spawn(move || {
-                let event = scan_directory_level(index, path, options);
+                let event = scan_directory_level(index, path, options, &cancel_flag);
                 let _ = tx.send(event);
             })
             .expect("spawn directory scanner");
@@ -307,11 +367,12 @@ impl ActiveScan {
         let path = node.path.clone();
         let boundary_dev = node.boundary_dev;
         let tx = self.event_tx.clone();
+        let cancel_flag = self.cancel_flag.clone();
 
         std::thread::Builder::new()
             .name("spacesniffer-summary-scan".into())
             .spawn(move || {
-                let summary = summarize_path_from_fs(&path, boundary_dev, options);
+                let summary = summarize_path_from_fs(&path, boundary_dev, options, &cancel_flag);
                 let _ = tx.send(ScanEvent::Summary { index, summary });
             })
             .expect("spawn summary scanner");
@@ -389,6 +450,7 @@ impl ActiveScan {
 
         self.stats.entries_traversed += stats.entries_traversed;
         self.stats.io_errors += stats.io_errors;
+        append_error_samples(&mut self.stats.error_samples, stats.error_samples);
         self.stats.total_bytes = self.nodes.first().map(|node| node.size);
         self.stats.active_jobs = self.stats.active_jobs.saturating_sub(1);
     }
@@ -412,6 +474,7 @@ impl ActiveScan {
 
         self.stats.entries_traversed += summary.entries_seen;
         self.stats.io_errors += summary.io_errors;
+        append_error_samples(&mut self.stats.error_samples, summary.error_samples);
         self.stats.total_bytes = self.nodes.first().map(|node| node.size);
         self.stats.active_jobs = self.stats.active_jobs.saturating_sub(1);
     }
@@ -450,6 +513,15 @@ impl ActiveScan {
     }
 }
 
+fn append_error_samples(samples: &mut Vec<IoErrorSample>, incoming: Vec<IoErrorSample>) {
+    for sample in incoming {
+        if samples.len() >= 8 {
+            break;
+        }
+        samples.push(sample);
+    }
+}
+
 pub fn children(scan: &ActiveScan, parent: TreeIndex) -> Vec<EntryView> {
     let mut entries = scan
         .nodes
@@ -458,7 +530,13 @@ pub fn children(scan: &ActiveScan, parent: TreeIndex) -> Vec<EntryView> {
         .flat_map(|node| node.children.iter())
         .filter_map(|idx| entry_view(scan, *idx))
         .collect::<Vec<_>>();
-    entries.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+    apply_pending_layout_weights(&mut entries);
+    entries.sort_by(|a, b| {
+        b.layout_size
+            .cmp(&a.layout_size)
+            .then_with(|| b.size.cmp(&a.size))
+            .then_with(|| a.name.cmp(&b.name))
+    });
     entries
 }
 
@@ -469,12 +547,59 @@ pub fn entry_view(scan: &ActiveScan, index: TreeIndex) -> Option<EntryView> {
         name: node.name.clone(),
         path: node.path.clone(),
         size: node.size,
+        layout_size: node.size,
         modified: node.modified,
         is_dir: node.is_dir,
         entry_count: node.entry_count,
         metadata_error: node.metadata_error,
         size_pending: node.is_dir && !node.summarized,
     })
+}
+
+fn apply_pending_layout_weights(entries: &mut [EntryView]) {
+    let pending_dirs = entries
+        .iter()
+        .filter(|entry| entry.is_dir && entry.size_pending)
+        .count();
+    if pending_dirs == 0 {
+        return;
+    }
+
+    let provisional = provisional_pending_layout_size(entries);
+    for entry in entries {
+        if entry.is_dir && entry.size_pending {
+            entry.layout_size = entry.layout_size.max(provisional);
+        }
+    }
+}
+
+fn provisional_pending_layout_size(entries: &[EntryView]) -> u128 {
+    let mut known_sizes = entries
+        .iter()
+        .filter(|entry| !entry.size_pending && entry.size > 0)
+        .map(|entry| entry.size)
+        .collect::<Vec<_>>();
+
+    if known_sizes.is_empty() {
+        return entries
+            .iter()
+            .map(|entry| entry.size)
+            .max()
+            .unwrap_or(1)
+            .max(PROVISIONAL_PENDING_LAYOUT_SIZE);
+    }
+
+    known_sizes.sort_unstable();
+    let median = known_sizes[known_sizes.len() / 2];
+    let average = known_sizes.iter().sum::<u128>() / known_sizes.len() as u128;
+    let max_known = *known_sizes.last().unwrap_or(&median);
+
+    // Pending directories should stay visible next to already-measured siblings,
+    // but not dominate the layout as if they were known to be the largest entry.
+    median
+        .max(average / 2)
+        .max(max_known / 6)
+        .max(PROVISIONAL_PENDING_LAYOUT_SIZE)
 }
 
 pub fn parent(scan: &ActiveScan, index: TreeIndex) -> Option<TreeIndex> {
@@ -503,7 +628,12 @@ pub fn is_root_path(path: &Path) -> bool {
     path.parent().is_none()
 }
 
-fn scan_directory_level(parent: TreeIndex, path: PathBuf, options: ScanOptions) -> ScanEvent {
+fn scan_directory_level(
+    parent: TreeIndex,
+    path: PathBuf,
+    options: ScanOptions,
+    cancel_flag: &AtomicBool,
+) -> ScanEvent {
     let root_dev = fs::symlink_metadata(&path).map(|meta| meta.dev()).ok();
     let mut children = Vec::new();
     let mut stats = ScanStats {
@@ -511,21 +641,39 @@ fn scan_directory_level(parent: TreeIndex, path: PathBuf, options: ScanOptions) 
         ..Default::default()
     };
 
-    let Ok(read_dir) = fs::read_dir(&path) else {
-        stats.io_errors += 1;
+    let read_dir = match fs::read_dir(&path) {
+        Ok(read_dir) => read_dir,
+        Err(err) => {
+            record_io_error(&mut stats.io_errors, &mut stats.error_samples, &path, err);
+            return ScanEvent::Children {
+                parent,
+                children,
+                options,
+                stats,
+            };
+        }
+    };
+
+    if cancel_flag.load(Ordering::Relaxed) {
         return ScanEvent::Children {
             parent,
             children,
             options,
             stats,
         };
-    };
+    }
 
     for entry in read_dir {
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
         stats.entries_traversed += 1;
-        let Ok(entry) = entry else {
-            stats.io_errors += 1;
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                record_io_error(&mut stats.io_errors, &mut stats.error_samples, &path, err);
+                continue;
+            }
         };
         let child_path = entry.path();
         match fs::symlink_metadata(&child_path) {
@@ -542,8 +690,13 @@ fn scan_directory_level(parent: TreeIndex, path: PathBuf, options: ScanOptions) 
                     boundary_dev: root_dev,
                 });
             }
-            Err(_) => {
-                stats.io_errors += 1;
+            Err(err) => {
+                record_io_error(
+                    &mut stats.io_errors,
+                    &mut stats.error_samples,
+                    &child_path,
+                    err,
+                );
                 children.push(ScannedEntry {
                     name: entry.file_name().to_string_lossy().to_string(),
                     path: child_path,
@@ -574,6 +727,7 @@ struct Summary {
     entry_count: u64,
     entries_seen: u64,
     io_errors: u64,
+    error_samples: Vec<IoErrorSample>,
     metadata_error: bool,
 }
 
@@ -583,6 +737,7 @@ fn summarize_path(
     root_dev: Option<u64>,
     options: ScanOptions,
     visited: &mut HashSet<(u64, u64)>,
+    cancel_flag: &AtomicBool,
 ) -> Summary {
     let mut summary = Summary {
         size: disk_size(metadata, options.apparent_size),
@@ -606,17 +761,39 @@ fn summarize_path(
 
     let mut queue = VecDeque::from([path.to_path_buf()]);
     while let Some(dir) = queue.pop_back() {
-        let Ok(read_dir) = fs::read_dir(&dir) else {
-            summary.io_errors += 1;
-            summary.metadata_error = true;
-            continue;
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(read_dir) => read_dir,
+            Err(err) => {
+                record_io_error(
+                    &mut summary.io_errors,
+                    &mut summary.error_samples,
+                    &dir,
+                    err,
+                );
+                summary.metadata_error = true;
+                continue;
+            }
         };
 
         for entry in read_dir {
+            if cancel_flag.load(Ordering::Relaxed) {
+                break;
+            }
             summary.entries_seen += 1;
-            let Ok(entry) = entry else {
-                summary.io_errors += 1;
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    record_io_error(
+                        &mut summary.io_errors,
+                        &mut summary.error_samples,
+                        &dir,
+                        err,
+                    );
+                    continue;
+                }
             };
             let entry_path = entry.path();
             match fs::symlink_metadata(&entry_path) {
@@ -635,8 +812,13 @@ fn summarize_path(
                         queue.push_back(entry_path);
                     }
                 }
-                Err(_) => {
-                    summary.io_errors += 1;
+                Err(err) => {
+                    record_io_error(
+                        &mut summary.io_errors,
+                        &mut summary.error_samples,
+                        &entry_path,
+                        err,
+                    );
                     summary.metadata_error = true;
                 }
             }
@@ -646,17 +828,52 @@ fn summarize_path(
     summary
 }
 
-fn summarize_path_from_fs(path: &Path, root_dev: Option<u64>, options: ScanOptions) -> Summary {
+fn summarize_path_from_fs(
+    path: &Path,
+    root_dev: Option<u64>,
+    options: ScanOptions,
+    cancel_flag: &AtomicBool,
+) -> Summary {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             let mut visited = HashSet::new();
-            summarize_path(path, &metadata, root_dev, options, &mut visited)
+            summarize_path(
+                path,
+                &metadata,
+                root_dev,
+                options,
+                &mut visited,
+                cancel_flag,
+            )
         }
-        Err(_) => Summary {
-            io_errors: 1,
-            metadata_error: true,
-            ..Default::default()
-        },
+        Err(err) => {
+            let mut summary = Summary {
+                metadata_error: true,
+                ..Default::default()
+            };
+            record_io_error(
+                &mut summary.io_errors,
+                &mut summary.error_samples,
+                path,
+                err,
+            );
+            summary
+        }
+    }
+}
+
+fn record_io_error(
+    count: &mut u64,
+    samples: &mut Vec<IoErrorSample>,
+    path: &Path,
+    err: std::io::Error,
+) {
+    *count += 1;
+    if samples.len() < 8 {
+        samples.push(IoErrorSample {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        });
     }
 }
 
@@ -693,6 +910,21 @@ mod tests {
                 |job| matches!(job, ScanJob::Children(queued_index, _) if *queued_index == index),
             )
             .count()
+    }
+
+    fn entry_for_layout(name: &str, size: u128, is_dir: bool, size_pending: bool) -> EntryView {
+        EntryView {
+            index: 0,
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            size,
+            layout_size: size,
+            modified: SystemTime::UNIX_EPOCH,
+            is_dir,
+            entry_count: None,
+            metadata_error: false,
+            size_pending,
+        }
     }
 
     #[test]
@@ -752,6 +984,43 @@ mod tests {
         assert!(!nested.size_pending);
         assert!(nested.size >= 5);
         assert!(nested.entry_count.is_some_and(|count| count >= 2));
+    }
+
+    #[test]
+    fn pending_directories_get_provisional_layout_weight() {
+        let mut entries = vec![
+            entry_for_layout("known-large", 12 * 1024 * 1024 * 1024, true, false),
+            entry_for_layout("workspace", 4096, true, true),
+            entry_for_layout("tiny-file", 512, false, false),
+        ];
+
+        apply_pending_layout_weights(&mut entries);
+
+        let workspace = entries
+            .iter()
+            .find(|entry| entry.name == "workspace")
+            .expect("workspace entry");
+        assert_eq!(workspace.size, 4096);
+        assert!(workspace.layout_size >= PROVISIONAL_PENDING_LAYOUT_SIZE);
+        assert!(workspace.layout_size > workspace.size);
+    }
+
+    #[test]
+    fn all_pending_directories_get_visible_floor() {
+        let mut entries = vec![
+            entry_for_layout("workspace", 4096, true, true),
+            entry_for_layout("src", 4096, true, true),
+            entry_for_layout("small-file", 512, false, false),
+        ];
+
+        apply_pending_layout_weights(&mut entries);
+
+        assert!(
+            entries
+                .iter()
+                .filter(|entry| entry.is_dir)
+                .all(|entry| entry.layout_size >= PROVISIONAL_PENDING_LAYOUT_SIZE)
+        );
     }
 
     #[test]
@@ -856,5 +1125,81 @@ mod tests {
         assert_eq!(scan.queued.len(), queued_before);
         assert_eq!(scan.background_queued.len(), background_before);
         assert_eq!(queued_child_jobs(&scan, nested.index), 0);
+    }
+
+    #[test]
+    fn cancel_stops_accepting_scan_results() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..8 {
+            fs::create_dir_all(dir.path().join(format!("dir-{index}/child")))
+                .expect("create child dir");
+            fs::write(
+                dir.path().join(format!("dir-{index}/child/file.txt")),
+                b"hello",
+            )
+            .expect("write file");
+        }
+
+        let options = ScanOptions {
+            apparent_size: true,
+            cross_filesystems: false,
+        };
+        let mut scan = ActiveScan::start(dir.path().to_path_buf(), options).expect("start scan");
+        wait_until(&mut scan, |scan| !children(scan, 0).is_empty());
+        scan.prefetch_children(0, options);
+
+        scan.cancel();
+        let entries_before = scan.stats.entries_traversed;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        scan.drain_events(100);
+
+        assert!(scan.canceled);
+        assert!(scan.finished);
+        assert_eq!(scan.stats.active_jobs, 0);
+        assert_eq!(scan.progress().queued_jobs, 0);
+        assert_eq!(scan.progress().background_jobs, 0);
+        assert_eq!(scan.stats.entries_traversed, entries_before);
+        assert!(scan.nodes.iter().all(|node| !node.scanning));
+        assert!(scan.nodes.iter().all(|node| !node.summarizing));
+    }
+
+    #[test]
+    fn progress_reports_interactive_and_background_work() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["a", "b", "c"] {
+            fs::create_dir(dir.path().join(name)).expect("create child dir");
+            fs::write(dir.path().join(name).join("file.txt"), b"hello").expect("write file");
+        }
+
+        let options = ScanOptions {
+            apparent_size: true,
+            cross_filesystems: false,
+        };
+        let mut scan = ActiveScan::start(dir.path().to_path_buf(), options).expect("start scan");
+        wait_until(&mut scan, |scan| !children(scan, 0).is_empty());
+
+        let progress = scan.progress();
+
+        assert!(progress.active_jobs <= MAX_SCAN_JOBS);
+        assert!(progress.background_jobs > 0 || progress.active_jobs > 0);
+        assert!(!progress.canceled);
+    }
+
+    #[test]
+    fn io_errors_keep_user_visible_samples() {
+        let mut count = 0;
+        let mut samples = Vec::new();
+
+        record_io_error(
+            &mut count,
+            &mut samples,
+            Path::new("/tmp/not-readable"),
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        );
+
+        assert_eq!(count, 1);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].path, Path::new("/tmp/not-readable"));
+        assert!(samples[0].message.contains("permission denied"));
     }
 }
