@@ -15,7 +15,9 @@ crossbeam = "0.8"
 eframe = { version = "0.34.2", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
 egui = "0.34.2"
 humansize = "2.1"
+jwalk = "0.8.1"
 rfd = { version = "0.15.4", default-features = false, features = ["tokio", "xdg-portal"] }
+tokio = { version = "1.52.3", features = ["net", "rt", "time"] }
 trash = "5.2"
 
 [dev-dependencies]

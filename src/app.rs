@@ -2,9 +2,10 @@ use crate::{
     deletion::{DeleteMode, delete_path, ensure_deletable},
     filters::{FilterEntry, Filters, parse_size_input_bytes},
     mounts::{Mount, discover_mounts},
-    scan::{self, ActiveScan, EntryView, ScanOptions, TreeIndex},
+    scan::{self, ActiveScan, EntryView, ScanOptions, SharedSummaryCache, TreeIndex},
     treemap::{self, TreemapItem},
 };
+use crossbeam::channel::{Receiver, TryRecvError};
 use eframe::egui::{
     self, Align2, Color32, FontFamily, FontId, RichText, Sense, Shape, Stroke, StrokeKind, Vec2,
 };
@@ -23,16 +24,21 @@ const INSPECTOR_CHILD_LIMIT: usize = 80;
 const TILE_HEADER_HEIGHT: f32 = 28.0;
 const MIN_IN_PLACE_SUBDIVIDE_WIDTH: f32 = 180.0;
 const MIN_IN_PLACE_SUBDIVIDE_HEIGHT: f32 = 132.0;
+const MIN_TREEMAP_PANEL_WIDTH: f32 = 420.0;
+const LAYOUT_ANIMATION_EPSILON: f64 = 0.015;
+const VISIBLE_CHILD_PREFETCH_LIMIT: usize = 8;
 
 pub struct App {
     path_input: String,
     mounts: Vec<Mount>,
     scan: Option<ActiveScan>,
+    summary_cache: SharedSummaryCache,
     focus: Option<TreeIndex>,
     selected: Option<TreeIndex>,
     expanded: HashSet<TreeIndex>,
     expansion_stack: Vec<TreeIndex>,
     expansion_started: HashMap<TreeIndex, f64>,
+    layout_animation: HashMap<TreeIndex, AnimatedLayoutSize>,
     click_pulses: Vec<ClickPulse>,
     filters: Filters,
     min_size_input: String,
@@ -46,7 +52,23 @@ pub struct App {
     show_filters: bool,
     show_scan_options: bool,
     show_theme_picker: bool,
+    show_help: bool,
+    folder_picker_rx: Option<Receiver<FolderPickerResult>>,
     ui_theme: UiTheme,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnimatedLayoutSize {
+    value: f64,
+    target: f64,
+    last_seen: f64,
+}
+
+#[derive(Debug, Clone)]
+enum FolderPickerResult {
+    Selected(PathBuf),
+    Canceled,
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -77,8 +99,25 @@ enum IconKind {
     Settings,
     Sliders,
     Palette,
+    Help,
     Drive,
     File,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HelpItem {
+    control: &'static str,
+    action: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SidePanelLayout {
+    left_default: f32,
+    left_min: f32,
+    left_max: f32,
+    right_default: f32,
+    right_min: f32,
+    right_max: f32,
 }
 
 impl UiTheme {
@@ -142,11 +181,13 @@ impl App {
             path_input,
             mounts: discover_mounts(),
             scan: None,
+            summary_cache: SharedSummaryCache::default(),
             focus: None,
             selected: None,
             expanded: HashSet::new(),
             expansion_stack: Vec::new(),
             expansion_started: HashMap::new(),
+            layout_animation: HashMap::new(),
             click_pulses: Vec::new(),
             filters: Filters::default(),
             min_size_input: String::from("0"),
@@ -160,6 +201,8 @@ impl App {
             show_filters: false,
             show_scan_options: false,
             show_theme_picker: false,
+            show_help: false,
+            folder_picker_rx: None,
             ui_theme,
         };
         app.start_scan();
@@ -172,13 +215,14 @@ impl App {
         }
         let path = PathBuf::from(self.path_input.trim());
         let options = self.scan_options();
-        match ActiveScan::start(path.clone(), options) {
+        match ActiveScan::start_with_cache(path.clone(), options, self.summary_cache.clone()) {
             Ok(scan) => {
                 self.focus = Some(0);
                 self.selected = Some(0);
                 self.expanded.clear();
                 self.expansion_stack.clear();
                 self.expansion_started.clear();
+                self.layout_animation.clear();
                 self.click_pulses.clear();
                 self.active_scan_options = options;
                 self.scan = Some(scan);
@@ -187,6 +231,61 @@ impl App {
             }
             Err(err) => {
                 self.status = format!("Scan failed: {err}");
+            }
+        }
+    }
+
+    fn folder_picker_active(&self) -> bool {
+        self.folder_picker_rx.is_some()
+    }
+
+    fn open_folder_picker(&mut self) {
+        if self.folder_picker_active() {
+            return;
+        }
+
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.folder_picker_rx = Some(rx);
+        self.status = "Opening folder picker...".into();
+
+        let spawn_result = std::thread::Builder::new()
+            .name("spacesniffer-folder-picker".into())
+            .spawn(move || {
+                let result =
+                    std::panic::catch_unwind(pick_folder_with_runtime).unwrap_or_else(|_| {
+                        FolderPickerResult::Failed("Folder picker crashed.".into())
+                    });
+                let _ = tx.send(result);
+            });
+
+        if let Err(err) = spawn_result {
+            self.folder_picker_rx = None;
+            self.status = format!("Folder picker failed to start: {err}");
+        }
+    }
+
+    fn poll_folder_picker(&mut self) {
+        let result = match self.folder_picker_rx.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) | None => return,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.folder_picker_rx = None;
+                self.status = "Folder picker closed unexpectedly.".into();
+                return;
+            }
+        };
+
+        self.folder_picker_rx = None;
+        match result {
+            FolderPickerResult::Selected(path) => {
+                self.path_input = path.display().to_string();
+                self.start_scan();
+            }
+            FolderPickerResult::Canceled => {
+                self.status = "Folder picker canceled.".into();
+            }
+            FolderPickerResult::Failed(message) => {
+                self.status = format!("Folder picker failed: {message}");
             }
         }
     }
@@ -267,6 +366,38 @@ impl App {
                 )
             })
             .collect()
+    }
+
+    fn animate_entry_layout_sizes(&mut self, entries: &mut [EntryView], time: f64) -> bool {
+        let mut animating = false;
+        for entry in entries {
+            let target = entry.layout_size.max(1) as f64;
+            let animated = self
+                .layout_animation
+                .entry(entry.index)
+                .or_insert(AnimatedLayoutSize {
+                    value: target,
+                    target,
+                    last_seen: time,
+                });
+            animated.target = target;
+            animated.last_seen = time;
+
+            let delta = animated.target - animated.value;
+            let relative_delta = (delta.abs() / animated.target.max(1.0)).min(1.0);
+            if relative_delta > LAYOUT_ANIMATION_EPSILON {
+                animated.value += delta * 0.22;
+                animating = true;
+            } else {
+                animated.value = animated.target;
+            }
+
+            entry.layout_size = animated.value.round().max(1.0) as u128;
+        }
+
+        self.layout_animation
+            .retain(|_, animated| time - animated.last_seen < 8.0);
+        animating
     }
 
     fn normalize_selection_to_visible_entries(&mut self) {
@@ -379,6 +510,7 @@ impl App {
         self.expanded.clear();
         self.expansion_stack.clear();
         self.expansion_started.clear();
+        self.layout_animation.clear();
         self.click_pulses.clear();
         self.zoom_flash = 1.0;
     }
@@ -429,19 +561,32 @@ impl App {
     }
 
     fn rescan_parent_after_delete(&mut self) {
+        let mut invalidate_path = None;
         if let Some(scan) = self.scan.as_ref()
             && let Some(focus) = self.focus.and_then(|idx| scan::entry_view(scan, idx))
         {
+            invalidate_path = Some(focus.path.clone());
             self.path_input = focus.path.display().to_string();
+        }
+        if let Some(path) = invalidate_path
+            && let Ok(mut cache) = self.summary_cache.lock()
+        {
+            cache.invalidate_prefix(&path);
         }
         self.start_scan();
     }
 
     fn update_scan(&mut self, ctx: &egui::Context) {
+        let changed = {
+            let Some(scan) = self.scan.as_mut() else {
+                return;
+            };
+            scan.drain_events(250)
+        };
+        let warmed = self.warm_visible_children();
         let Some(scan) = self.scan.as_mut() else {
             return;
         };
-        let changed = scan.drain_events(250);
         if scan.canceled {
             self.status = format!(
                 "Canceled scan after {} entries.",
@@ -468,10 +613,25 @@ impl App {
             );
             ctx.request_repaint_after(Duration::from_millis(50));
         }
-        if changed {
+        if changed || warmed {
             self.normalize_selection_to_visible_entries();
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+    }
+
+    fn warm_visible_children(&mut self) -> bool {
+        let options = self.scan_options();
+        let mut parents = Vec::new();
+        if let Some(focus) = self.focus {
+            parents.push(focus);
+        }
+        parents.extend(self.expanded.iter().copied());
+        parents.sort_unstable();
+        parents.dedup();
+
+        self.scan.as_mut().is_some_and(|scan| {
+            scan.warm_visible_children(&parents, options, VISIBLE_CHILD_PREFETCH_LIMIT) > 0
+        })
     }
 
     fn handle_navigation_buttons(&mut self, ctx: &egui::Context) {
@@ -485,6 +645,8 @@ impl App {
             end_pressed,
             enter_pressed,
             backspace_pressed,
+            f1_pressed,
+            question_pressed,
             ctrl_pressed,
             time,
         ) = ctx.input(|input| {
@@ -498,10 +660,15 @@ impl App {
                 input.key_pressed(egui::Key::End),
                 input.key_pressed(egui::Key::Enter),
                 input.key_pressed(egui::Key::Backspace),
+                input.key_pressed(egui::Key::F1),
+                input.key_pressed(egui::Key::Questionmark),
                 input.modifiers.ctrl,
                 input.time,
             )
         });
+        if f1_pressed {
+            self.show_help = true;
+        }
         if back_clicked && self.can_go_up() {
             self.go_up();
         }
@@ -512,10 +679,14 @@ impl App {
             self.show_filters = false;
             self.show_scan_options = false;
             self.show_theme_picker = false;
+            self.show_help = false;
             self.pending_delete = None;
         }
         if ctx.egui_wants_keyboard_input() {
             return;
+        }
+        if question_pressed {
+            self.show_help = true;
         }
         if up_pressed {
             self.select_sibling(-1);
@@ -545,7 +716,7 @@ impl App {
                 self.go_up();
             }
 
-            let icon_count = 6.0;
+            let icon_count = 7.0;
             let icon_width = 44.0;
             let icon_spacing = ui.spacing().item_spacing.x;
             let controls_width = icon_count * icon_width + icon_count * icon_spacing;
@@ -571,11 +742,16 @@ impl App {
                 self.start_scan();
             }
 
-            if icon_button(ui, IconKind::Folder, "Choose folder").clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            let folder_picker_active = self.folder_picker_active();
+            if icon_button_enabled(
+                ui,
+                IconKind::Folder,
+                folder_picker_tooltip(folder_picker_active),
+                !folder_picker_active,
+            )
+            .clicked()
             {
-                self.path_input = path.display().to_string();
-                self.start_scan();
+                self.open_folder_picker();
             }
             let path_dirty = self.path_dirty();
             let refresh_response = icon_button(
@@ -606,6 +782,9 @@ impl App {
             }
             if icon_button(ui, IconKind::Palette, "Theme (Esc closes)").clicked() {
                 self.show_theme_picker = true;
+            }
+            if icon_button(ui, IconKind::Help, "Help (F1 or ?)").clicked() {
+                self.show_help = true;
             }
         });
         ui.add_space(6.0);
@@ -692,6 +871,7 @@ impl App {
         let mut normalize_selection = false;
         egui::Window::new(title)
             .open(&mut self.show_filters)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
             .default_width(460.0)
@@ -793,6 +973,7 @@ impl App {
         let mut open = self.show_scan_options;
         egui::Window::new("Scan Options")
             .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
             .default_width(380.0)
@@ -862,6 +1043,7 @@ impl App {
         let mut close_after_selection = false;
         egui::Window::new("Theme")
             .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
             .default_width(340.0)
@@ -878,6 +1060,32 @@ impl App {
                 }
             });
         self.show_theme_picker = open && !close_after_selection;
+    }
+
+    fn help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+
+        let mut open = self.show_help;
+        egui::Window::new("Help")
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(740.0)
+            .default_height(560.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        help_section(ui, "Navigation", navigation_help_items());
+                        help_section(ui, "Scanning", scanning_help_items());
+                        help_section(ui, "Tools", tool_help_items());
+                        help_section(ui, "Inspector", inspector_help_items());
+                    });
+            });
+        self.show_help = open;
     }
 
     fn left_panel(&mut self, ui: &mut egui::Ui) {
@@ -963,6 +1171,10 @@ impl App {
                     self.filters_active(),
                 );
                 ui.add_space(12.0);
+                if let Some(progress) = visible_progress_summary(entries) {
+                    progress_chip(ui, &progress, self.ui_theme);
+                    ui.add_space(10.0);
+                }
                 type_legend(ui);
                 ui.add_space(10.0);
                 size_legend(ui, self.ui_theme);
@@ -982,7 +1194,11 @@ impl App {
         if entries.is_empty() {
             let loading_focus = matches!(
                 focused_state,
-                Some(scan::DirectoryScanState::Pending | scan::DirectoryScanState::Scanning)
+                Some(
+                    scan::DirectoryScanState::Pending
+                        | scan::DirectoryScanState::Scanning
+                        | scan::DirectoryScanState::Estimating
+                )
             );
             let empty_text = if loading_focus {
                 "Loading this folder..."
@@ -1082,11 +1298,16 @@ impl App {
                 None
             };
             let is_expanded = self.expanded.contains(&entry.index);
-            let expanded_children = if is_expanded {
+            let mut expanded_children = if is_expanded {
                 self.filtered_children(entry.index)
             } else {
                 Vec::new()
             };
+            if !expanded_children.is_empty()
+                && self.animate_entry_layout_sizes(&mut expanded_children, time)
+            {
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            }
 
             let stroke = if selected == Some(entry.index) {
                 Stroke::new(3.0, Color32::WHITE)
@@ -1169,7 +1390,7 @@ impl App {
             );
 
             paint_tile_label(painter, tile_rect, entry, color);
-            paint_tile_scan_badge(painter, tile_rect, directory_state, entry.size_pending);
+            paint_tile_scan_badge(painter, tile_rect, entry, directory_state);
 
             tile_response.clone().on_hover_ui(|ui| {
                 ui.label(RichText::new(&entry.name).strong());
@@ -1368,7 +1589,11 @@ impl App {
         if children.is_empty() {
             if matches!(
                 self.focused_directory_state(),
-                Some(scan::DirectoryScanState::Pending | scan::DirectoryScanState::Scanning)
+                Some(
+                    scan::DirectoryScanState::Pending
+                        | scan::DirectoryScanState::Scanning
+                        | scan::DirectoryScanState::Estimating
+                )
             ) {
                 inspector_note(ui, "Loading children", true, self.ui_theme);
             } else {
@@ -1421,6 +1646,7 @@ impl App {
             DeleteMode::Permanent => "Permanent Delete",
         };
         egui::Window::new(title)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
             .default_width(560.0)
@@ -1478,6 +1704,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_navigation_buttons(ctx);
+        self.poll_folder_picker();
         self.update_scan(ctx);
         let time = ctx.input(|input| input.time);
         self.click_pulses
@@ -1492,8 +1719,11 @@ impl eframe::App for App {
             .expansion_started
             .values()
             .any(|started_at| time - started_at < 0.32);
-        let animating =
-            scanning || revealing || !self.click_pulses.is_empty() || self.zoom_flash > 0.0;
+        let animating = scanning
+            || revealing
+            || self.folder_picker_active()
+            || !self.click_pulses.is_empty()
+            || self.zoom_flash > 0.0;
         if animating {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -1501,6 +1731,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let side_panels = responsive_side_panel_layout(ui.available_width());
 
         egui::Panel::top("top").show_inside(ui, |ui| {
             self.top_bar(ui);
@@ -1508,12 +1739,16 @@ impl eframe::App for App {
 
         egui::Panel::left("mounts")
             .resizable(true)
-            .default_size(220.0)
+            .default_size(side_panels.left_default)
+            .min_size(side_panels.left_min)
+            .max_size(side_panels.left_max)
             .show_inside(ui, |ui| self.left_panel(ui));
 
         egui::Panel::right("inspector")
             .resizable(true)
-            .default_size(280.0)
+            .default_size(side_panels.right_default)
+            .min_size(side_panels.right_min)
+            .max_size(side_panels.right_max)
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("inspector-panel")
@@ -1522,7 +1757,11 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            let focused_entries = self.focused_entries();
+            let mut focused_entries = self.focused_entries();
+            let time = ui.input(|input| input.time);
+            if self.animate_entry_layout_sizes(&mut focused_entries, time) {
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            }
             self.treemap_header(ui, &focused_entries);
             ui.separator();
             self.treemap(ui, &focused_entries);
@@ -1532,6 +1771,7 @@ impl eframe::App for App {
         self.filter_window(&ctx);
         self.scan_options_window(&ctx);
         self.theme_window(&ctx);
+        self.help_window(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1545,6 +1785,24 @@ impl eframe::App for App {
     }
 }
 
+fn pick_folder_with_runtime() -> FolderPickerResult {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => return FolderPickerResult::Failed(err.to_string()),
+    };
+
+    runtime.block_on(async {
+        rfd::AsyncFileDialog::new()
+            .pick_folder()
+            .await
+            .map(|handle| FolderPickerResult::Selected(handle.path().to_path_buf()))
+            .unwrap_or(FolderPickerResult::Canceled)
+    })
+}
+
 fn stored_bool(storage: Option<&dyn eframe::Storage>, key: &str) -> Option<bool> {
     storage
         .and_then(|storage| storage.get_string(key))
@@ -1555,9 +1813,51 @@ fn human_bytes(bytes: u128) -> String {
     format_size(bytes.min(u64::MAX as u128) as u64, BINARY)
 }
 
+fn folder_picker_tooltip(active: bool) -> &'static str {
+    if active {
+        "Folder picker is already open"
+    } else {
+        "Choose folder"
+    }
+}
+
+fn responsive_side_panel_layout(window_width: f32) -> SidePanelLayout {
+    let width = window_width.max(0.0);
+    let compactness = ((900.0 - width) / 420.0).clamp(0.0, 1.0);
+    let left_min = lerp_f32(176.0, 132.0, compactness);
+    let right_min = lerp_f32(232.0, 176.0, compactness);
+    let mut left_default = (width * 0.16).clamp(left_min, 286.0);
+    let mut right_default = (width * 0.22).clamp(right_min, 386.0);
+
+    // Keep the tree view dominant. On narrow windows, shrink side panels together.
+    let desired_side_total = left_default + right_default;
+    let max_side_total = (width - MIN_TREEMAP_PANEL_WIDTH).max(left_min + right_min);
+    if desired_side_total > max_side_total {
+        let scale = (max_side_total / desired_side_total).clamp(0.0, 1.0);
+        left_default = (left_default * scale).max(left_min);
+        right_default = (right_default * scale).max(right_min);
+    }
+
+    let left_max = (width * 0.24).clamp(left_min.max(left_default), 340.0);
+    let right_max = (width * 0.32).clamp(right_min.max(right_default), 460.0);
+
+    SidePanelLayout {
+        left_default,
+        left_min,
+        left_max,
+        right_default,
+        right_min,
+        right_max,
+    }
+}
+
+fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
 fn entry_size_text(entry: &EntryView) -> String {
     if entry.size_pending {
-        String::from("estimating")
+        String::from("measuring")
     } else {
         human_bytes(entry.size)
     }
@@ -1566,8 +1866,9 @@ fn entry_size_text(entry: &EntryView) -> String {
 fn directory_state_text(state: scan::DirectoryScanState) -> &'static str {
     match state {
         scan::DirectoryScanState::NotDirectory => "file",
-        scan::DirectoryScanState::Pending => "children not loaded yet",
+        scan::DirectoryScanState::Pending => "waiting to estimate",
         scan::DirectoryScanState::Scanning => "loading children",
+        scan::DirectoryScanState::Estimating => "measuring size",
         scan::DirectoryScanState::Scanned => "children cached in this session",
     }
 }
@@ -1774,6 +2075,154 @@ fn scan_mode_tooltip(options: ScanOptions) -> String {
     format!("{size_detail}\n{fs_detail}")
 }
 
+fn navigation_help_items() -> &'static [HelpItem] {
+    &[
+        HelpItem {
+            control: "Click folder tile",
+            action: "Subdivide large tiles in place or focus small tiles.",
+        },
+        HelpItem {
+            control: "Double-click child row",
+            action: "Subdivide that folder from the inspector list.",
+        },
+        HelpItem {
+            control: "Enter",
+            action: "Subdivide the selected folder.",
+        },
+        HelpItem {
+            control: "Ctrl+Enter",
+            action: "Focus the selected folder as the treemap root.",
+        },
+        HelpItem {
+            control: "Up button / Backspace / Mouse Back",
+            action: "Go back up one expanded or focused folder.",
+        },
+        HelpItem {
+            control: "Arrow Up / Arrow Down",
+            action: "Move selection through visible siblings.",
+        },
+        HelpItem {
+            control: "Home / End",
+            action: "Select the first or last visible sibling.",
+        },
+    ]
+}
+
+fn scanning_help_items() -> &'static [HelpItem] {
+    &[
+        HelpItem {
+            control: "F5 / Refresh",
+            action: "Start a fresh disk scan and clear the current in-memory scan tree.",
+        },
+        HelpItem {
+            control: "Cancel",
+            action: "Stop accepting results from the current scan.",
+        },
+        HelpItem {
+            control: "Ctrl+L",
+            action: "Focus the path box.",
+        },
+        HelpItem {
+            control: "Enter in path box",
+            action: "Scan the typed path.",
+        },
+        HelpItem {
+            control: "Folder button",
+            action: "Choose a scan root with the system folder picker without blocking the UI.",
+        },
+        HelpItem {
+            control: "Scan options",
+            action: "Switch disk usage/file size and mounted-volume traversal.",
+        },
+    ]
+}
+
+fn tool_help_items() -> &'static [HelpItem] {
+    &[
+        HelpItem {
+            control: "Filters",
+            action: "Filter visible entries by name, size, or modified age.",
+        },
+        HelpItem {
+            control: "Theme",
+            action: "Choose Graphite, Frost, or Retrowave.",
+        },
+        HelpItem {
+            control: "F1 / ?",
+            action: "Open this help window.",
+        },
+        HelpItem {
+            control: "Esc",
+            action: "Close popups and pending delete confirmation.",
+        },
+    ]
+}
+
+fn inspector_help_items() -> &'static [HelpItem] {
+    &[
+        HelpItem {
+            control: "Subdivide",
+            action: "Show selected folder children inside its tile.",
+        },
+        HelpItem {
+            control: "Focus View",
+            action: "Use selected folder as the full treemap root.",
+        },
+        HelpItem {
+            control: "Move to Trash",
+            action: "Delete selected path through the desktop trash.",
+        },
+        HelpItem {
+            control: "Permanent Delete",
+            action: "Require typing the exact path before irreversible deletion.",
+        },
+    ]
+}
+
+#[cfg(test)]
+fn all_help_items() -> impl Iterator<Item = &'static HelpItem> {
+    navigation_help_items()
+        .iter()
+        .chain(scanning_help_items())
+        .chain(tool_help_items())
+        .chain(inspector_help_items())
+}
+
+fn help_section(ui: &mut egui::Ui, title: &str, items: &[HelpItem]) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).size(22.0).strong());
+        ui.add_space(8.0);
+        ui.separator();
+    });
+    ui.add_space(8.0);
+
+    let control_width = 240.0;
+    egui::Grid::new(format!("help-section-{title}"))
+        .num_columns(2)
+        .striped(true)
+        .min_col_width(0.0)
+        .spacing(egui::vec2(18.0, 10.0))
+        .show(ui, |ui| {
+            ui.add_sized(
+                [control_width, 22.0],
+                egui::Label::new(RichText::new("Control").size(14.0).strong()),
+            );
+            ui.label(RichText::new("Action").size(14.0).strong());
+            ui.end_row();
+
+            for item in items {
+                ui.add_sized(
+                    [control_width, 30.0],
+                    egui::Label::new(RichText::new(item.control).monospace().strong().size(15.5)),
+                );
+                ui.label(RichText::new(item.action).size(15.0));
+                ui.end_row();
+            }
+        });
+    ui.add_space(14.0);
+}
+
 fn focus_summary(
     ui: &mut egui::Ui,
     entry: Option<EntryView>,
@@ -1793,6 +2242,41 @@ fn focus_summary(
         if entry.is_dir { "folder" } else { "file" }
     );
     ui.label(RichText::new(text).small().weak());
+}
+
+fn visible_progress_summary(entries: &[EntryView]) -> Option<String> {
+    let mut measuring = 0;
+    let mut waiting = 0;
+    let mut measured = 0;
+
+    for entry in entries.iter().filter(|entry| entry.is_dir) {
+        if entry.estimating {
+            measuring += 1;
+        } else if entry.size_pending {
+            waiting += 1;
+        } else {
+            measured += 1;
+        }
+    }
+
+    if measuring == 0 && waiting == 0 {
+        return None;
+    }
+
+    let mut parts = vec![format!("{measuring} measuring")];
+    if waiting > 0 {
+        parts.push(format!("{waiting} waiting"));
+    }
+    if measured > 0 {
+        parts.push(format!("{measured} measured"));
+    }
+    Some(parts.join(" | "))
+}
+
+fn progress_chip(ui: &mut egui::Ui, text: &str, theme: UiTheme) -> egui::Response {
+    filter_chip(ui, text, theme).on_hover_text(
+        "Visible folder sizes are being measured in the background; tiles animate as estimates update.",
+    )
 }
 
 fn paint_toolbar_badge(painter: &egui::Painter, rect: egui::Rect, theme: UiTheme) {
@@ -1852,52 +2336,92 @@ fn option_toggle(
     pending: bool,
     theme: UiTheme,
 ) -> egui::Response {
-    let width = ((label.chars().count() as f32 * 7.0) + 56.0).clamp(112.0, 176.0);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 28.0), Sense::click());
+    let width = ((label.chars().count() as f32 * 8.0) + 154.0).clamp(260.0, 340.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 46.0), Sense::click());
     if response.clicked() {
         *value = !*value;
     }
 
     let visuals = ui.style().interact_selectable(&response, *value);
     let fill = if *value {
-        themed_effect_color(theme, 58)
+        themed_effect_color(theme, 50)
     } else {
-        visuals.bg_fill
+        ui.visuals().extreme_bg_color
     };
     let stroke = if *value {
-        Stroke::new(1.0, themed_effect_color(theme, 170))
+        Stroke::new(1.3, themed_effect_color(theme, 185))
     } else {
-        visuals.bg_stroke
+        Stroke::new(1.2, ui.visuals().widgets.inactive.bg_stroke.color)
     };
-    ui.painter().rect_filled(rect, 14.0, fill);
+    ui.painter().rect_filled(rect, 6.0, fill);
     ui.painter()
-        .rect_stroke(rect, 14.0, stroke, StrokeKind::Inside);
+        .rect_stroke(rect, 6.0, stroke, StrokeKind::Inside);
 
-    let knob_center = if *value {
-        rect.right_center() - egui::vec2(14.0, 0.0)
+    let switch_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - 106.0, rect.center().y - 15.0),
+        egui::vec2(90.0, 30.0),
+    );
+    let switch_fill = if *value {
+        themed_effect_color(theme, 175)
     } else {
-        rect.left_center() + egui::vec2(14.0, 0.0)
+        ui.visuals().widgets.inactive.bg_fill
     };
-    ui.painter().circle_filled(
+    ui.painter().rect_filled(switch_rect, 15.0, switch_fill);
+    ui.painter().rect_stroke(
+        switch_rect,
+        15.0,
+        Stroke::new(1.0, color_with_alpha(visuals.fg_stroke.color, 120)),
+        StrokeKind::Inside,
+    );
+
+    let knob_radius = 11.0;
+    let knob_center = if *value {
+        switch_rect.right_center() - egui::vec2(16.0, 0.0)
+    } else {
+        switch_rect.left_center() + egui::vec2(16.0, 0.0)
+    };
+    ui.painter()
+        .circle_filled(knob_center, knob_radius, Color32::WHITE);
+    ui.painter().circle_stroke(
         knob_center,
-        7.0,
+        knob_radius,
+        Stroke::new(1.0, color_with_alpha(Color32::BLACK, 45)),
+    );
+
+    let state_rect = if *value {
+        egui::Rect::from_min_max(
+            switch_rect.left_top(),
+            egui::pos2(knob_center.x - knob_radius, switch_rect.bottom()),
+        )
+    } else {
+        egui::Rect::from_min_max(
+            egui::pos2(knob_center.x + knob_radius, switch_rect.top()),
+            switch_rect.right_bottom(),
+        )
+    };
+    clipped_text(
+        ui.painter(),
+        state_rect.shrink2(egui::vec2(4.0, 0.0)),
+        Align2::CENTER_CENTER,
+        if *value { "ON" } else { "OFF" },
+        FontId::monospace(12.5),
         if *value {
-            themed_effect_color(theme, 225)
+            Color32::WHITE
         } else {
             ui.visuals().weak_text_color()
         },
     );
 
     let text_clip = egui::Rect::from_min_max(
-        rect.left_top() + egui::vec2(29.0, 0.0),
-        rect.right_bottom() - egui::vec2(25.0, 0.0),
+        rect.left_top() + egui::vec2(14.0, 0.0),
+        switch_rect.left_bottom() - egui::vec2(12.0, 0.0),
     );
     clipped_text(
         ui.painter(),
         text_clip,
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(12.0),
+        FontId::proportional(15.0),
         visuals.text_color(),
     );
 
@@ -3003,36 +3527,46 @@ fn paint_tile_label(painter: &egui::Painter, rect: egui::Rect, entry: &EntryView
     }
 }
 
+fn tile_scan_status_text(
+    entry: &EntryView,
+    state: Option<scan::DirectoryScanState>,
+) -> Option<String> {
+    match state? {
+        scan::DirectoryScanState::Pending => Some(String::from("waiting")),
+        scan::DirectoryScanState::Scanning => Some(String::from("loading")),
+        scan::DirectoryScanState::Estimating => Some(measuring_status_text(entry)),
+        scan::DirectoryScanState::Scanned if entry.size_pending => {
+            Some(measuring_status_text(entry))
+        }
+        _ => None,
+    }
+}
+
 fn paint_tile_scan_badge(
     painter: &egui::Painter,
     rect: egui::Rect,
+    entry: &EntryView,
     state: Option<scan::DirectoryScanState>,
-    size_pending: bool,
 ) {
-    let Some(state) = state else {
-        return;
-    };
-    let text = match state {
-        scan::DirectoryScanState::Pending => Some("click to load"),
-        scan::DirectoryScanState::Scanning => Some("loading"),
-        scan::DirectoryScanState::Scanned if size_pending => Some("estimating"),
-        _ => None,
-    };
-    let Some(text) = text else {
+    let Some(text) = tile_scan_status_text(entry, state) else {
         return;
     };
     if rect.width() < 104.0 || rect.height() < 52.0 {
         return;
     }
 
-    let badge = egui::Rect::from_min_size(
-        rect.left_bottom() + egui::vec2(8.0, -28.0),
-        egui::vec2(
-            (text.len() as f32 * 7.0 + 18.0).min(rect.width() - 16.0),
-            20.0,
-        ),
-    );
+    let Some(badge) = tile_scan_badge_rect(rect, entry, &text) else {
+        return;
+    };
     painter.rect_filled(badge, 10.0, Color32::from_black_alpha(92));
+    if entry.estimating {
+        let progress = estimate_progress_fraction(entry.estimate_entries_seen);
+        let fill = egui::Rect::from_min_max(
+            badge.left_top(),
+            egui::pos2(badge.left() + badge.width() * progress, badge.bottom()),
+        );
+        painter.rect_filled(fill, 10.0, Color32::from_white_alpha(38));
+    }
     painter.rect_stroke(
         badge,
         10.0,
@@ -3043,10 +3577,52 @@ fn paint_tile_scan_badge(
         painter,
         badge.shrink2(egui::vec2(8.0, 0.0)),
         Align2::LEFT_CENTER,
-        text,
+        &text,
         FontId::proportional(11.0),
         Color32::from_white_alpha(210),
     );
+}
+
+fn measuring_status_text(entry: &EntryView) -> String {
+    if entry.estimate_entries_seen > 0 {
+        format!(
+            "measuring {} entries",
+            compact_count(entry.estimate_entries_seen)
+        )
+    } else {
+        String::from("measuring")
+    }
+}
+
+fn estimate_progress_fraction(entries_seen: u64) -> f32 {
+    if entries_seen == 0 {
+        return 0.08;
+    }
+    ((entries_seen as f32).log10() / 5.0).clamp(0.12, 0.92)
+}
+
+fn compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f32 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f32 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn tile_scan_badge_rect(rect: egui::Rect, entry: &EntryView, text: &str) -> Option<egui::Rect> {
+    if rect.width() < 104.0 || rect.height() < 84.0 {
+        return None;
+    }
+
+    let layout = tile_label_layout_with_status(rect, entry, Some(text))?;
+    let badge_row = layout.status_rect?;
+    let width = (text.len() as f32 * 7.0 + 18.0).min(rect.width() - 16.0);
+    Some(egui::Rect::from_min_size(
+        badge_row.left_top(),
+        egui::vec2(width, badge_row.height()),
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3054,11 +3630,20 @@ struct TileLabelLayout {
     name_rect: egui::Rect,
     size_rect: Option<egui::Rect>,
     count_rect: Option<egui::Rect>,
+    status_rect: Option<egui::Rect>,
     name_font_size: f32,
     name_char_width: f32,
 }
 
 fn tile_label_layout(rect: egui::Rect, entry: &EntryView) -> Option<TileLabelLayout> {
+    tile_label_layout_with_status(rect, entry, None)
+}
+
+fn tile_label_layout_with_status(
+    rect: egui::Rect,
+    entry: &EntryView,
+    status_text: Option<&str>,
+) -> Option<TileLabelLayout> {
     if rect.width() < 76.0 || rect.height() < 36.0 {
         return None;
     }
@@ -3085,23 +3670,53 @@ fn tile_label_layout(rect: egui::Rect, entry: &EntryView) -> Option<TileLabelLay
         return None;
     }
 
-    let size_rect = (rect.width() > 92.0 && rect.height() > 52.0).then(|| {
-        egui::Rect::from_min_max(
-            rect.left_bottom() + egui::vec2(8.0, -30.0),
-            rect.right_bottom() - egui::vec2(8.0, 10.0),
-        )
-    });
-    let count_rect = (detailed && entry.is_dir).then(|| {
-        egui::Rect::from_min_max(
-            rect.left_top() + egui::vec2(8.0, TILE_HEADER_HEIGHT + 7.0),
-            egui::pos2(rect.right() - 8.0, rect.top() + TILE_HEADER_HEIGHT + 24.0),
-        )
-    });
+    let row_left = rect.left() + 8.0;
+    let row_right = rect.right() - 8.0;
+    let row_gap = 4.0;
+    let mut cursor = rect.top() + TILE_HEADER_HEIGHT + 7.0;
+    let content_bottom = rect.bottom() - 10.0;
+    let wants_status = status_text.is_some() && rect.width() >= 104.0 && rect.height() >= 84.0;
+    let wants_size = rect.width() > 92.0 && rect.height() > 52.0;
+    let wants_count = detailed && entry.is_dir && rect.height() > 112.0;
+
+    let count_rect = wants_count
+        .then(|| {
+            let row = egui::Rect::from_min_max(
+                egui::pos2(row_left, cursor),
+                egui::pos2(row_right, cursor + 17.0),
+            );
+            cursor = row.bottom() + row_gap;
+            row
+        })
+        .filter(|row| row.bottom() <= content_bottom);
+
+    let status_rect = wants_status
+        .then(|| {
+            let row = egui::Rect::from_min_max(
+                egui::pos2(row_left, cursor),
+                egui::pos2(row_right, cursor + 20.0),
+            );
+            cursor = row.bottom() + row_gap;
+            row
+        })
+        .filter(|row| row.bottom() <= content_bottom);
+
+    let size_rect = wants_size
+        .then(|| {
+            let top = if status_rect.is_some() || count_rect.is_some() {
+                cursor.max(rect.bottom() - 30.0)
+            } else {
+                rect.bottom() - 30.0
+            };
+            egui::Rect::from_min_max(egui::pos2(row_left, top), egui::pos2(row_right, top + 20.0))
+        })
+        .filter(|row| row.bottom() <= content_bottom);
 
     Some(TileLabelLayout {
         name_rect,
         size_rect,
         count_rect,
+        status_rect,
         name_font_size,
         name_char_width,
     })
@@ -3430,6 +4045,21 @@ fn paint_symbolic_icon(painter: &egui::Painter, rect: egui::Rect, icon: IconKind
                 stroke,
             );
         }
+        IconKind::Help => {
+            painter.circle_stroke(
+                rect.center(),
+                rect.width().min(rect.height()) * 0.35,
+                stroke,
+            );
+            clipped_text(
+                painter,
+                rect,
+                Align2::CENTER_CENTER,
+                "?",
+                FontId::proportional(rect.height() * 0.62),
+                color,
+            );
+        }
         IconKind::Drive => {
             let body = egui::Rect::from_min_max(
                 egui::pos2(
@@ -3553,6 +4183,7 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn test_entry(name: &str, is_dir: bool) -> EntryView {
         EntryView {
@@ -3566,6 +4197,39 @@ mod tests {
             entry_count: Some(3),
             metadata_error: false,
             size_pending: false,
+            estimating: false,
+            estimate_entries_seen: 0,
+        }
+    }
+
+    fn animation_test_app() -> App {
+        App {
+            path_input: String::new(),
+            mounts: Vec::new(),
+            scan: None,
+            summary_cache: SharedSummaryCache::default(),
+            focus: None,
+            selected: None,
+            expanded: HashSet::new(),
+            expansion_stack: Vec::new(),
+            expansion_started: HashMap::new(),
+            layout_animation: HashMap::new(),
+            click_pulses: Vec::new(),
+            filters: Filters::default(),
+            min_size_input: String::new(),
+            apparent_size: false,
+            cross_filesystems: false,
+            active_scan_options: ScanOptions::default(),
+            status: String::new(),
+            pending_delete: None,
+            permanent_confirmation: String::new(),
+            zoom_flash: 0.0,
+            show_filters: false,
+            show_scan_options: false,
+            show_theme_picker: false,
+            show_help: false,
+            folder_picker_rx: None,
+            ui_theme: UiTheme::Graphite,
         }
     }
 
@@ -3615,11 +4279,15 @@ mod tests {
     fn directory_state_copy_explains_lazy_loading_and_cache() {
         assert_eq!(
             directory_state_text(scan::DirectoryScanState::Pending),
-            "children not loaded yet"
+            "waiting to estimate"
         );
         assert_eq!(
             directory_state_text(scan::DirectoryScanState::Scanning),
             "loading children"
+        );
+        assert_eq!(
+            directory_state_text(scan::DirectoryScanState::Estimating),
+            "measuring size"
         );
         assert_eq!(
             directory_state_text(scan::DirectoryScanState::Scanned),
@@ -3628,8 +4296,171 @@ mod tests {
     }
 
     #[test]
+    fn folder_picker_tooltip_reports_active_state() {
+        assert_eq!(folder_picker_tooltip(false), "Choose folder");
+        assert_eq!(folder_picker_tooltip(true), "Folder picker is already open");
+    }
+
+    #[test]
+    fn side_panels_shrink_on_compact_windows() {
+        let compact = responsive_side_panel_layout(760.0);
+        let wide = responsive_side_panel_layout(1600.0);
+
+        assert!(compact.left_default < wide.left_default);
+        assert!(compact.right_default < wide.right_default);
+        assert!(compact.left_default >= compact.left_min);
+        assert!(compact.right_default >= compact.right_min);
+    }
+
+    #[test]
+    fn side_panels_leave_room_for_tree_view() {
+        for width in [720.0, 960.0, 1280.0, 1800.0] {
+            let layout = responsive_side_panel_layout(width);
+
+            assert!(layout.left_min <= layout.left_default);
+            assert!(layout.left_default <= layout.left_max);
+            assert!(layout.right_min <= layout.right_default);
+            assert!(layout.right_default <= layout.right_max);
+            assert!(width - layout.left_default - layout.right_default >= 300.0);
+        }
+    }
+
+    #[test]
+    fn layout_animation_eases_toward_new_size() {
+        let mut app = animation_test_app();
+        let mut entries = vec![test_entry("target", true)];
+
+        assert!(!app.animate_entry_layout_sizes(&mut entries, 1.0));
+        entries[0].layout_size = 16 * 1024;
+
+        assert!(app.animate_entry_layout_sizes(&mut entries, 1.1));
+        assert!(entries[0].layout_size > 1024);
+        assert!(entries[0].layout_size < 16 * 1024);
+    }
+
+    #[test]
+    fn layout_animation_reaches_target_after_repeated_frames() {
+        let mut app = animation_test_app();
+        let mut entries = vec![test_entry("target", true)];
+
+        app.animate_entry_layout_sizes(&mut entries, 1.0);
+        entries[0].layout_size = 4096;
+        let mut animating = true;
+        for frame in 0..40 {
+            entries[0].layout_size = 4096;
+            animating = app.animate_entry_layout_sizes(&mut entries, 1.1 + frame as f64 * 0.016);
+        }
+
+        assert!(!animating);
+        assert_eq!(entries[0].layout_size, 4096);
+    }
+
+    #[test]
+    fn visible_progress_summary_reports_progressive_states() {
+        let mut measuring = test_entry("measuring", true);
+        measuring.size_pending = true;
+        measuring.estimating = true;
+        let mut waiting = test_entry("waiting", true);
+        waiting.index = 2;
+        waiting.size_pending = true;
+        let mut measured = test_entry("measured", true);
+        measured.index = 3;
+
+        assert_eq!(
+            visible_progress_summary(&[measuring, waiting, measured]).as_deref(),
+            Some("1 measuring | 1 waiting | 1 measured")
+        );
+    }
+
+    #[test]
+    fn visible_progress_summary_hides_when_all_visible_dirs_are_measured() {
+        let measured = test_entry("measured", true);
+
+        assert!(visible_progress_summary(&[measured]).is_none());
+    }
+
+    #[test]
+    fn update_scan_warms_visible_children_without_clicking_tiles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["workspace", "target", "src"] {
+            let child = dir.path().join(name);
+            fs::create_dir(&child).expect("create child dir");
+            fs::create_dir(child.join("nested")).expect("create nested dir");
+            fs::write(child.join("nested/file.txt"), b"hello").expect("write nested file");
+        }
+
+        let mut app = animation_test_app();
+        app.path_input = dir.path().display().to_string();
+        app.apparent_size = true;
+        app.start_scan();
+        let ctx = egui::Context::default();
+
+        let mut warmed_without_click = false;
+        for _ in 0..300 {
+            app.update_scan(&ctx);
+            if let Some(scan) = app.scan.as_ref() {
+                warmed_without_click = app.focused_entries().iter().any(|entry| {
+                    entry.is_dir
+                        && matches!(
+                            scan::directory_scan_state(scan, entry.index),
+                            Some(
+                                scan::DirectoryScanState::Scanning
+                                    | scan::DirectoryScanState::Scanned
+                            )
+                        )
+                });
+                if warmed_without_click {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(warmed_without_click);
+    }
+
+    #[test]
+    fn help_menu_lists_core_hotkeys_and_buttons() {
+        let controls = all_help_items()
+            .map(|item| item.control)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "F5 / Refresh",
+            "Cancel",
+            "Ctrl+L",
+            "Enter in path box",
+            "Folder button",
+            "Scan options",
+            "Filters",
+            "Theme",
+            "F1 / ?",
+            "Esc",
+            "Enter",
+            "Ctrl+Enter",
+            "Up button / Backspace / Mouse Back",
+            "Arrow Up / Arrow Down",
+            "Home / End",
+            "Subdivide",
+            "Focus View",
+            "Move to Trash",
+            "Permanent Delete",
+        ] {
+            assert!(
+                controls.contains(&expected),
+                "help menu should mention {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_menu_items_have_action_copy() {
+        assert!(all_help_items().all(|item| !item.action.trim().is_empty()));
+    }
+
+    #[test]
     fn tile_label_layout_keeps_text_below_header_divider() {
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(180.0, 90.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(180.0, 120.0));
         let entry = test_entry("very-long-directory-name-that-must-fit", true);
         let layout = tile_label_layout(rect, &entry).expect("tile label layout");
 
@@ -3672,6 +4503,56 @@ mod tests {
             layout.name_font_size,
             true
         ));
+    }
+
+    #[test]
+    fn tile_scan_badge_avoids_size_text_band() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(180.0, 90.0));
+        let entry = test_entry("workspace", true);
+        let layout = tile_label_layout(rect, &entry).expect("tile label layout");
+        let badge = tile_scan_badge_rect(rect, &entry, "estimating").expect("scan badge");
+
+        assert!(layout.size_rect.is_none_or(|size| !badge.intersects(size)));
+        assert!(!badge.intersects(layout.name_rect));
+    }
+
+    #[test]
+    fn tile_scan_badge_hides_when_tile_is_too_short() {
+        let short = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(180.0, 68.0));
+        let entry = test_entry("workspace", true);
+
+        assert!(tile_scan_badge_rect(short, &entry, "estimating").is_none());
+    }
+
+    #[test]
+    fn tile_scan_badge_uses_separate_row_after_count() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(220.0, 130.0));
+        let entry = test_entry("workspace", true);
+        let layout = tile_label_layout(rect, &entry).expect("tile label layout");
+        let count = layout.count_rect.expect("count row");
+        let size = layout.size_rect.expect("size row");
+        let badge = tile_scan_badge_rect(rect, &entry, "estimating").expect("scan badge");
+
+        assert!(!badge.intersects(count));
+        assert!(!badge.intersects(size));
+        assert!(badge.top() > count.bottom());
+    }
+
+    #[test]
+    fn measuring_status_includes_progress_count() {
+        let mut entry = test_entry("workspace", true);
+        entry.size_pending = true;
+        entry.estimating = true;
+        entry.estimate_entries_seen = 1_240;
+
+        assert_eq!(measuring_status_text(&entry), "measuring 1.2K entries");
+    }
+
+    #[test]
+    fn estimating_progress_fraction_grows_with_entries_seen() {
+        assert!(estimate_progress_fraction(0) > 0.0);
+        assert!(estimate_progress_fraction(10_000) > estimate_progress_fraction(10));
+        assert!(estimate_progress_fraction(1_000_000) <= 0.92);
     }
 
     #[test]
