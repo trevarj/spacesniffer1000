@@ -12,7 +12,7 @@ Native graphical disk space visualizer inspired by SpaceSniffer.
 guix shell -m manifest.scm -- cargo run --bin ss1000
 ```
 
-Enter a path or choose a mounted filesystem, then press `Scan`. Click treemap rectangles to zoom into directories. Use breadcrumbs or `Up` to navigate back.
+Enter a path or choose a mounted filesystem. The app scans automatically on launch and after path changes. Click treemap rectangles to zoom into directories. Use breadcrumbs or `Up` to navigate back.
 
 ## Controls
 
@@ -30,7 +30,7 @@ guix shell -m manifest.scm -- cargo build --release
 
 The release binary is `target/release/ss1000`.
 
-The Guix package entry is `guix.scm`. It documents the remaining crate-vendoring step needed for fully offline Guix package builds.
+The Guix package entry is `guix.scm`.
 
 ## Screenshot
 

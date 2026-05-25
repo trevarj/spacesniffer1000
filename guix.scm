@@ -50,7 +50,7 @@
     (synopsis "Native graphical disk space visualizer")
     (description
      "SpaceSniffer1000 is an egui desktop application for exploring filesystem usage with a clickable treemap.")
-    (home-page "https://example.invalid/spacesniffer1000")
+    (home-page "https://github.com/trevarj/spacesniffer1000")
     (license license:expat)))
 
 spacesniffer1000

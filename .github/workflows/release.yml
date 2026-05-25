@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin ss1000 --target "$TARGET"
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME:-manual}"
+          archive="ss1000-${version}-${TARGET}"
+          mkdir -p "dist/${archive}"
+          cp "target/${TARGET}/release/ss1000" "dist/${archive}/"
+          cp README.md LICENSE* "dist/${archive}/" 2>/dev/null || true
+          tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
+          sha256sum "dist/${archive}.tar.gz" > "dist/${archive}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss1000-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
