@@ -2,7 +2,7 @@
 
 Native graphical disk space visualizer inspired by SpaceSniffer.
 
-![SpaceSniffer1000 logo](assets/logo.png)
+<img src="assets/logo.png" alt="SpaceSniffer1000 logo" width="240">
 
 ## Run
 

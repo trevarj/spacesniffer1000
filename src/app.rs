@@ -2822,23 +2822,11 @@ fn paint_tile_body(
             ),
         );
         painter.rect_filled(header, 2.0, overlay_color(theme, 54));
-        painter.line_segment(
-            [
-                egui::pos2(header.left(), header.bottom()),
-                egui::pos2(header.right(), header.bottom()),
-            ],
-            Stroke::new(1.0, color_with_alpha(foreground, 42)),
-        );
         if rect.width() > 54.0 && rect.height() > 34.0 {
-            let tab = egui::Rect::from_min_size(
-                rect.left_top() + egui::vec2(9.0, 5.0),
-                egui::vec2((rect.width() * 0.14).clamp(16.0, 42.0), 4.0),
-            );
-            painter.rect_filled(tab, 1.0, color_with_alpha(foreground, 105));
             paint_symbolic_icon(
                 painter,
                 egui::Rect::from_min_size(
-                    rect.left_top() + egui::vec2(10.0, 11.0),
+                    rect.left_top() + egui::vec2(10.0, 8.0),
                     Vec2::splat(13.0),
                 ),
                 IconKind::Folder,
