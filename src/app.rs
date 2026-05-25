@@ -2107,7 +2107,7 @@ fn action_button(
     destructive: bool,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 54.0), Sense::click());
     let visuals = ui.style().interact(&response);
     let bg = if destructive {
         Color32::from_rgba_unmultiplied(115, 35, 42, 90)
@@ -2129,25 +2129,25 @@ fn action_button(
     ui.painter()
         .rect_stroke(rect, 5.0, stroke, StrokeKind::Inside);
     let title_rect = egui::Rect::from_min_max(
-        rect.left_top() + egui::vec2(10.0, 5.0),
-        rect.right_top() + egui::vec2(-10.0, 25.0),
+        rect.left_top() + egui::vec2(10.0, 7.0),
+        rect.right_top() + egui::vec2(-10.0, 29.0),
     );
     clipped_text(
         ui.painter(),
         title_rect,
-        Align2::LEFT_TOP,
+        Align2::LEFT_CENTER,
         title,
         FontId::proportional(15.0),
         title_color,
     );
     let detail_rect = egui::Rect::from_min_max(
-        rect.left_bottom() + egui::vec2(10.0, -20.0),
-        rect.right_bottom() - egui::vec2(10.0, 4.0),
+        rect.left_top() + egui::vec2(10.0, 30.0),
+        rect.right_bottom() - egui::vec2(10.0, 7.0),
     );
     clipped_text(
         ui.painter(),
         detail_rect,
-        Align2::LEFT_BOTTOM,
+        Align2::LEFT_CENTER,
         detail,
         FontId::proportional(12.0),
         ui.visuals().weak_text_color(),
@@ -2297,11 +2297,7 @@ fn clipped_text(
 }
 
 fn clipped_text_geometry(rect: egui::Rect, align: Align2) -> (egui::Rect, egui::Pos2) {
-    let clip_rect = match align {
-        Align2::LEFT_TOP => rect.expand2(egui::vec2(0.0, 2.0)),
-        Align2::LEFT_BOTTOM | Align2::RIGHT_BOTTOM => rect.expand2(egui::vec2(0.0, 1.0)),
-        _ => rect,
-    };
+    let clip_rect = rect.expand2(egui::vec2(0.0, 2.0));
     let pos = match align {
         Align2::LEFT_TOP => rect.left_top() + egui::vec2(0.0, 1.0),
         Align2::LEFT_CENTER => rect.left_center(),
@@ -3521,6 +3517,16 @@ mod tests {
         assert!(clip_rect.bottom() > rect.bottom());
         assert!(pos.y > rect.top());
         assert!(pos.y < rect.center().y);
+    }
+
+    #[test]
+    fn clipped_center_aligned_text_has_ascender_bleed() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(120.0, 18.0));
+        let (clip_rect, pos) = clipped_text_geometry(rect, Align2::LEFT_CENTER);
+
+        assert!(clip_rect.top() < rect.top());
+        assert!(clip_rect.bottom() > rect.bottom());
+        assert_eq!(pos, rect.left_center());
     }
 
     #[test]
