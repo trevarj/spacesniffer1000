@@ -2,7 +2,7 @@ use crate::{
     deletion::{DeleteMode, delete_path, ensure_deletable},
     filters::{FilterEntry, Filters, parse_size_input_bytes},
     mounts::{Mount, discover_mounts},
-    scan::{self, ActiveScan, EntryView, ScanOptions, SharedSummaryCache, TreeIndex},
+    scan::{self, ActiveScan, EntryView, ScanOptions, ScanWake, SharedSummaryCache, TreeIndex},
     treemap::{self, TreemapItem},
 };
 use crossbeam::channel::{Receiver, TryRecvError};
@@ -205,12 +205,8 @@ impl App {
             folder_picker_rx: None,
             ui_theme,
         };
-        app.start_scan();
+        app.start_scan_with_repaint(Some(&cc.egui_ctx));
         app
-    }
-
-    fn start_scan(&mut self) {
-        self.start_scan_with_repaint(None);
     }
 
     fn start_scan_with_repaint(&mut self, ctx: Option<&egui::Context>) {
@@ -219,7 +215,16 @@ impl App {
         }
         let path = PathBuf::from(self.path_input.trim());
         let options = self.scan_options();
-        match ActiveScan::start_with_cache(path.clone(), options, self.summary_cache.clone()) {
+        let wake_ui = ctx.map(|ctx| {
+            let ctx = ctx.clone();
+            ScanWake::new(move || ctx.request_repaint())
+        });
+        match ActiveScan::start_with_cache_and_wake(
+            path.clone(),
+            options,
+            self.summary_cache.clone(),
+            wake_ui,
+        ) {
             Ok(scan) => {
                 self.focus = Some(0);
                 self.selected = Some(0);
@@ -1872,7 +1877,7 @@ fn entry_size_text(entry: &EntryView) -> String {
 }
 
 fn provisional_size_text(bytes: u128) -> String {
-    format!(">= {}", human_bytes(bytes))
+    format!("≥ {}", human_bytes(bytes))
 }
 
 fn directory_state_text(state: scan::DirectoryScanState) -> &'static str {
@@ -4413,7 +4418,7 @@ mod tests {
         let mut app = animation_test_app();
         app.path_input = dir.path().display().to_string();
         app.apparent_size = true;
-        app.start_scan();
+        app.start_scan_with_repaint(None);
         let ctx = egui::Context::default();
 
         let mut warmed_without_click = false;
@@ -4567,7 +4572,7 @@ mod tests {
         entry.size = 42 * 1024 * 1024;
         entry.estimate_entries_seen = 1_240;
 
-        assert_eq!(measuring_status_text(&entry), ">= 42 MiB | 1.2K entries");
+        assert_eq!(measuring_status_text(&entry), "≥ 42 MiB | 1.2K entries");
     }
 
     #[test]
@@ -4576,7 +4581,7 @@ mod tests {
         entry.size_pending = true;
         entry.size = 7 * 1024 * 1024;
 
-        assert_eq!(entry_size_text(&entry), ">= 7 MiB");
+        assert_eq!(entry_size_text(&entry), "≥ 7 MiB");
     }
 
     #[test]

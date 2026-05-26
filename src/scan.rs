@@ -3,7 +3,7 @@ use crossbeam::channel::{Receiver, Sender};
 use jwalk::{Parallelism, WalkDirGeneric};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs,
+    fmt, fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
@@ -30,6 +30,7 @@ pub struct ActiveScan {
     queued: VecDeque<ScanJob>,
     background_queued: VecDeque<ScanJob>,
     summary_cache: SharedSummaryCache,
+    wake_ui: Option<ScanWake>,
     pub root: PathBuf,
     pub finished: bool,
     pub canceled: bool,
@@ -43,6 +44,25 @@ pub struct ScanOptions {
 }
 
 pub type SharedSummaryCache = Arc<Mutex<SummaryCache>>;
+
+#[derive(Clone)]
+pub struct ScanWake(Arc<dyn Fn() + Send + Sync>);
+
+impl ScanWake {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(wake))
+    }
+
+    fn wake(&self) {
+        (self.0)();
+    }
+}
+
+impl fmt::Debug for ScanWake {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ScanWake").field(&"<callback>").finish()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct SummaryCache {
@@ -263,6 +283,15 @@ impl ActiveScan {
         options: ScanOptions,
         summary_cache: SharedSummaryCache,
     ) -> Result<Self> {
+        Self::start_with_cache_and_wake(root, options, summary_cache, None)
+    }
+
+    pub fn start_with_cache_and_wake(
+        root: PathBuf,
+        options: ScanOptions,
+        summary_cache: SharedSummaryCache,
+        wake_ui: Option<ScanWake>,
+    ) -> Result<Self> {
         let metadata = fs::symlink_metadata(&root)
             .with_context(|| format!("failed to read metadata for {}", root.display()))?;
         let (event_tx, event_rx) = crossbeam::channel::unbounded();
@@ -294,6 +323,7 @@ impl ActiveScan {
             queued: VecDeque::new(),
             background_queued: VecDeque::new(),
             summary_cache,
+            wake_ui,
             root,
             finished: false,
             canceled: false,
@@ -549,11 +579,12 @@ impl ActiveScan {
         let path = node.path.clone();
         let tx = self.event_tx.clone();
         let cancel_flag = self.cancel_flag.clone();
+        let wake_ui = self.wake_ui.clone();
 
         std::thread::Builder::new()
             .name("spacesniffer-level-scan".into())
             .spawn(move || {
-                scan_directory_level(index, path, options, &cancel_flag, &tx);
+                scan_directory_level(index, path, options, &cancel_flag, &tx, wake_ui.as_ref());
             })
             .expect("spawn directory scanner");
     }
@@ -588,13 +619,25 @@ impl ActiveScan {
         self.stats.active_jobs += 1;
         let tx = self.event_tx.clone();
         let cancel_flag = self.cancel_flag.clone();
+        let wake_ui = self.wake_ui.clone();
 
         std::thread::Builder::new()
             .name("spacesniffer-summary-scan".into())
             .spawn(move || {
-                let summary =
-                    summarize_path_from_fs(index, &path, boundary_dev, options, cancel_flag, &tx);
-                let _ = tx.send(ScanEvent::Summary {
+                let summary = summarize_path_from_fs(
+                    index,
+                    &path,
+                    boundary_dev,
+                    options,
+                    cancel_flag,
+                    &tx,
+                    wake_ui.as_ref(),
+                );
+                ScanEventSink {
+                    tx: &tx,
+                    wake_ui: wake_ui.as_ref(),
+                }
+                .send(ScanEvent::Summary {
                     index,
                     options,
                     summary,
@@ -733,6 +776,7 @@ impl ActiveScan {
         append_error_samples(&mut self.stats.error_samples, stats.error_samples);
         self.stats.total_bytes = self.nodes.first().map(|node| node.size);
         if done {
+            self.enqueue_job(ScanJob::Summary(parent, options), JobPriority::Background);
             self.stats.active_jobs = self.stats.active_jobs.saturating_sub(1);
         }
     }
@@ -987,6 +1031,7 @@ fn scan_directory_level(
     options: ScanOptions,
     cancel_flag: &AtomicBool,
     tx: &Sender<ScanEvent>,
+    wake_ui: Option<&ScanWake>,
 ) {
     let root_dev = fs::symlink_metadata(&path).map(|meta| meta.dev()).ok();
     let mut children = Vec::with_capacity(CHILD_BATCH_SIZE);
@@ -996,13 +1041,13 @@ fn scan_directory_level(
         Ok(read_dir) => read_dir,
         Err(err) => {
             record_io_error(&mut stats.io_errors, &mut stats.error_samples, &path, err);
-            send_child_batch(tx, parent, &mut children, options, stats, true);
+            send_child_batch(tx, wake_ui, parent, &mut children, options, stats, true);
             return;
         }
     };
 
     if cancel_flag.load(Ordering::Relaxed) {
-        send_child_batch(tx, parent, &mut children, options, stats, true);
+        send_child_batch(tx, wake_ui, parent, &mut children, options, stats, true);
         return;
     }
 
@@ -1053,12 +1098,12 @@ fn scan_directory_level(
             }
         }
         if children.len() >= CHILD_BATCH_SIZE {
-            send_child_batch(tx, parent, &mut children, options, stats, false);
+            send_child_batch(tx, wake_ui, parent, &mut children, options, stats, false);
             stats = child_batch_stats();
         }
     }
 
-    send_child_batch(tx, parent, &mut children, options, stats, true);
+    send_child_batch(tx, wake_ui, parent, &mut children, options, stats, true);
 }
 
 fn child_batch_stats() -> ScanStats {
@@ -1070,6 +1115,7 @@ fn child_batch_stats() -> ScanStats {
 
 fn send_child_batch(
     tx: &Sender<ScanEvent>,
+    wake_ui: Option<&ScanWake>,
     parent: TreeIndex,
     children: &mut Vec<ScannedEntry>,
     options: ScanOptions,
@@ -1083,7 +1129,7 @@ fn send_child_batch(
         stats,
         done,
     };
-    let _ = tx.send(event);
+    ScanEventSink { tx, wake_ui }.send(event);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1103,6 +1149,22 @@ struct SummaryProgress {
     entries_seen: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ScanEventSink<'a> {
+    tx: &'a Sender<ScanEvent>,
+    wake_ui: Option<&'a ScanWake>,
+}
+
+impl ScanEventSink<'_> {
+    fn send(self, event: ScanEvent) {
+        if self.tx.send(event).is_ok()
+            && let Some(wake_ui) = self.wake_ui
+        {
+            wake_ui.wake();
+        }
+    }
+}
+
 type WalkClientState = ((), Option<std::result::Result<fs::Metadata, jwalk::Error>>);
 
 fn summarize_path_with_jwalk(
@@ -1112,7 +1174,7 @@ fn summarize_path_with_jwalk(
     root_dev: Option<u64>,
     options: ScanOptions,
     cancel_flag: Arc<AtomicBool>,
-    tx: &Sender<ScanEvent>,
+    sink: ScanEventSink<'_>,
 ) -> Summary {
     let mut summary = Summary {
         size: disk_size(metadata, options.apparent_size),
@@ -1242,7 +1304,7 @@ fn summarize_path_with_jwalk(
         }
         summary.size += disk_size(metadata, options.apparent_size);
         summary.entry_count += 1;
-        send_summary_progress_if_due(index, &summary, tx);
+        send_summary_progress_if_due(index, &summary, sink);
     }
 
     summary
@@ -1255,10 +1317,12 @@ fn summarize_path_from_fs(
     options: ScanOptions,
     cancel_flag: Arc<AtomicBool>,
     tx: &Sender<ScanEvent>,
+    wake_ui: Option<&ScanWake>,
 ) -> Summary {
+    let sink = ScanEventSink { tx, wake_ui };
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            summarize_path_with_jwalk(index, path, &metadata, root_dev, options, cancel_flag, tx)
+            summarize_path_with_jwalk(index, path, &metadata, root_dev, options, cancel_flag, sink)
         }
         Err(err) => {
             let mut summary = Summary {
@@ -1276,7 +1340,7 @@ fn summarize_path_from_fs(
     }
 }
 
-fn send_summary_progress_if_due(index: TreeIndex, summary: &Summary, tx: &Sender<ScanEvent>) {
+fn send_summary_progress_if_due(index: TreeIndex, summary: &Summary, sink: ScanEventSink<'_>) {
     if !summary
         .entries_seen
         .is_multiple_of(SUMMARY_PROGRESS_INTERVAL)
@@ -1284,7 +1348,7 @@ fn send_summary_progress_if_due(index: TreeIndex, summary: &Summary, tx: &Sender
         return;
     }
 
-    let _ = tx.send(ScanEvent::SummaryProgress {
+    sink.send(ScanEvent::SummaryProgress {
         index,
         progress: SummaryProgress {
             size: summary.size,
@@ -1469,6 +1533,32 @@ mod tests {
     }
 
     #[test]
+    fn scanned_root_finalizes_its_recursive_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for child in 0..(BACKGROUND_SUMMARIES_PER_LEVEL + 6) {
+            let child_dir = dir.path().join(format!("child-{child:02}"));
+            fs::create_dir(&child_dir).expect("create child dir");
+            fs::write(child_dir.join("file.txt"), b"hello").expect("write child file");
+        }
+
+        let mut scan = ActiveScan::start(
+            dir.path().to_path_buf(),
+            ScanOptions {
+                apparent_size: true,
+                cross_filesystems: false,
+            },
+        )
+        .expect("start scan");
+
+        wait_until(&mut scan, |scan| scan.finished);
+
+        let root = entry_view(&scan, 0).expect("root entry");
+        assert!(!root.size_pending);
+        assert!(root.size >= (BACKGROUND_SUMMARIES_PER_LEVEL + 6) as u128 * 5);
+        assert!(root.entry_count.is_some_and(|count| count > 1));
+    }
+
+    #[test]
     fn directory_level_scan_streams_large_directories_in_batches() {
         let dir = tempfile::tempdir().expect("tempdir");
         for index in 0..(CHILD_BATCH_SIZE + 5) {
@@ -1485,6 +1575,7 @@ mod tests {
             },
             &AtomicBool::new(false),
             &tx,
+            None,
         );
 
         let first = rx.try_recv().expect("first child batch");
@@ -1509,6 +1600,61 @@ mod tests {
     }
 
     #[test]
+    fn directory_level_scan_wakes_ui_when_events_are_sent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("file.txt"), b"x").expect("write file");
+        let (tx, _rx) = crossbeam::channel::unbounded();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_counter = wakes.clone();
+        let wake = ScanWake::new(move || {
+            wake_counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        scan_directory_level(
+            0,
+            dir.path().to_path_buf(),
+            ScanOptions {
+                apparent_size: true,
+                cross_filesystems: false,
+            },
+            &AtomicBool::new(false),
+            &tx,
+            Some(&wake),
+        );
+
+        assert!(wakes.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn active_scan_worker_wakes_without_event_drain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("file.txt"), b"x").expect("write file");
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_counter = wakes.clone();
+        let wake = ScanWake::new(move || {
+            wake_counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let _scan = ActiveScan::start_with_cache_and_wake(
+            dir.path().to_path_buf(),
+            ScanOptions {
+                apparent_size: true,
+                cross_filesystems: false,
+            },
+            SharedSummaryCache::default(),
+            Some(wake),
+        )
+        .expect("start scan");
+
+        for _ in 0..100 {
+            if wakes.load(Ordering::Relaxed) > 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("scan worker did not wake UI without event drain");
+    }
+
+    #[test]
     fn summary_scan_reports_progress_before_completion() {
         let dir = tempfile::tempdir().expect("tempdir");
         let nested = dir.path().join("nested");
@@ -1527,6 +1673,7 @@ mod tests {
             },
             Arc::new(AtomicBool::new(false)),
             &tx,
+            None,
         );
 
         assert!(summary.entries_seen > SUMMARY_PROGRESS_INTERVAL);
@@ -1540,6 +1687,48 @@ mod tests {
         assert_eq!(progress.0, 7);
         assert!(progress.1.entries_seen >= SUMMARY_PROGRESS_INTERVAL);
         assert!(progress.1.size > 0);
+    }
+
+    #[test]
+    fn active_scan_refines_child_size_before_summary_finishes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).expect("create nested");
+        for index in 0..(SUMMARY_PROGRESS_INTERVAL as usize + 64) {
+            fs::write(nested.join(format!("file-{index:04}.txt")), b"x").expect("write file");
+        }
+        let options = ScanOptions {
+            apparent_size: true,
+            cross_filesystems: false,
+        };
+        let mut scan = ActiveScan::start(dir.path().to_path_buf(), options).expect("start scan");
+
+        wait_until(&mut scan, |scan| !children(scan, 0).is_empty());
+        let nested_index = children(&scan, 0)
+            .into_iter()
+            .find(|entry| entry.name == "nested")
+            .expect("nested entry")
+            .index;
+        let initial_size = scan.nodes[nested_index].size;
+        let mut observed_progress_size = None;
+
+        for _ in 0..1000 {
+            scan.drain_events(1);
+            let node = &scan.nodes[nested_index];
+            if !node.summarized && node.size > initial_size {
+                observed_progress_size = Some(node.size);
+            }
+            if node.summarized {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let progress_size =
+            observed_progress_size.expect("size should increase before final summary");
+        let final_size = scan.nodes[nested_index].size;
+        assert!(final_size >= progress_size);
+        assert!(scan.nodes[nested_index].summarized);
     }
 
     #[test]
@@ -1563,6 +1752,7 @@ mod tests {
             },
             Arc::new(AtomicBool::new(false)),
             &tx,
+            None,
         );
 
         assert_eq!(summary.entry_count, 2);
