@@ -2636,13 +2636,14 @@ fn child_row_button(
     ui.painter()
         .rect_stroke(rect, 5.0, visuals.bg_stroke, StrokeKind::Inside);
 
-    let bar_width = (rect.width() * share as f32).clamp(2.0, rect.width());
-    let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(bar_width, rect.height()));
-    ui.painter().rect_filled(
-        bar,
-        5.0,
-        themed_effect_color(theme, if selected { 72 } else { 38 }),
-    );
+    let bar_track = rect.shrink(1.0);
+    if let Some(bar) = progress_fill_rect(bar_track, share as f32) {
+        ui.painter().rect_filled(
+            bar,
+            4.0,
+            themed_effect_color(theme, if selected { 72 } else { 38 }),
+        );
+    }
 
     let icon_rect =
         egui::Rect::from_min_size(rect.left_top() + egui::vec2(9.0, 10.0), Vec2::splat(22.0));
@@ -3213,12 +3214,10 @@ fn selected_summary_card(
         );
         ui.painter()
             .rect_filled(track, 2.0, visuals.extreme_bg_color);
-        let fill = egui::Rect::from_min_max(
-            track.left_top(),
-            egui::pos2(track.left() + track.width() * share as f32, track.bottom()),
-        );
-        ui.painter()
-            .rect_filled(fill, 2.0, themed_effect_color(theme, 180));
+        if let Some(fill) = progress_fill_rect(track, share as f32) {
+            ui.painter()
+                .rect_filled(fill, 2.0, themed_effect_color(theme, 180));
+        }
     }
 }
 
@@ -3233,6 +3232,22 @@ fn percentage_text(value: f64) -> String {
     } else {
         String::from("0%")
     }
+}
+
+fn progress_fill_rect(track: egui::Rect, progress: f32) -> Option<egui::Rect> {
+    if track.width() <= 0.0 || track.height() <= 0.0 {
+        return None;
+    }
+    let progress = progress.clamp(0.0, 1.0);
+    if progress <= 0.0 {
+        return None;
+    }
+    let min_width = 2.0_f32.min(track.width());
+    let width = (track.width() * progress).clamp(min_width, track.width());
+    Some(egui::Rect::from_min_max(
+        track.left_top(),
+        egui::pos2(track.left() + width, track.bottom()),
+    ))
 }
 
 fn size_legend(ui: &mut egui::Ui, theme: UiTheme) {
@@ -3578,11 +3593,12 @@ fn paint_tile_scan_badge(
     painter.rect_filled(badge, 10.0, Color32::from_black_alpha(92));
     if entry.estimating {
         let progress = estimate_progress_fraction(entry.estimate_entries_seen);
-        let fill = egui::Rect::from_min_max(
-            badge.left_top(),
-            egui::pos2(badge.left() + badge.width() * progress, badge.bottom()),
-        );
-        painter.rect_filled(fill, 10.0, Color32::from_white_alpha(38));
+        if let Some(track) = tile_scan_badge_progress_track(badge) {
+            painter.rect_filled(track, 2.0, Color32::from_white_alpha(30));
+            if let Some(fill) = progress_fill_rect(track, progress) {
+                painter.rect_filled(fill, 2.0, Color32::from_white_alpha(82));
+            }
+        }
     }
     painter.rect_stroke(
         badge,
@@ -3592,7 +3608,7 @@ fn paint_tile_scan_badge(
     );
     clipped_text(
         painter,
-        badge.shrink2(egui::vec2(8.0, 0.0)),
+        tile_scan_badge_text_rect(badge),
         Align2::LEFT_CENTER,
         &text,
         FontId::proportional(11.0),
@@ -3636,10 +3652,28 @@ fn tile_scan_badge_rect(rect: egui::Rect, entry: &EntryView, text: &str) -> Opti
 
     let layout = tile_label_layout_with_status(rect, entry, Some(text))?;
     let badge_row = layout.status_rect?;
-    let width = (text.len() as f32 * 7.0 + 18.0).min(rect.width() - 16.0);
+    let width = (text.chars().count() as f32 * 7.0 + 18.0).min(rect.width() - 16.0);
     Some(egui::Rect::from_min_size(
         badge_row.left_top(),
         egui::vec2(width, badge_row.height()),
+    ))
+}
+
+fn tile_scan_badge_text_rect(badge: egui::Rect) -> egui::Rect {
+    let bottom_inset = if badge.height() >= 20.0 { 7.0 } else { 0.0 };
+    egui::Rect::from_min_max(
+        badge.left_top() + egui::vec2(8.0, 0.0),
+        egui::pos2(badge.right() - 8.0, badge.bottom() - bottom_inset),
+    )
+}
+
+fn tile_scan_badge_progress_track(badge: egui::Rect) -> Option<egui::Rect> {
+    if badge.width() < 28.0 || badge.height() < 20.0 {
+        return None;
+    }
+    Some(egui::Rect::from_min_max(
+        egui::pos2(badge.left() + 8.0, badge.bottom() - 6.0),
+        egui::pos2(badge.right() - 8.0, badge.bottom() - 3.0),
     ))
 }
 
@@ -4562,6 +4596,31 @@ mod tests {
         assert!(!badge.intersects(count));
         assert!(!badge.intersects(size));
         assert!(badge.top() > count.bottom());
+    }
+
+    #[test]
+    fn tile_scan_badge_progress_fits_below_text() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(220.0, 110.0));
+        let entry = test_entry("workspace", true);
+        let badge =
+            tile_scan_badge_rect(rect, &entry, "≥ 42 MiB | 1.2K entries").expect("scan badge");
+        let text = tile_scan_badge_text_rect(badge);
+        let track = tile_scan_badge_progress_track(badge).expect("progress track");
+        let fill = progress_fill_rect(track, 0.5).expect("progress fill");
+
+        assert!(badge.contains_rect(text));
+        assert!(badge.contains_rect(track));
+        assert!(!text.intersects(track));
+        assert!(track.contains_rect(fill));
+    }
+
+    #[test]
+    fn progress_fill_rect_clamps_to_track() {
+        let track = egui::Rect::from_min_size(egui::pos2(4.0, 8.0), egui::vec2(80.0, 6.0));
+        let fill = progress_fill_rect(track, 2.0).expect("progress fill");
+
+        assert_eq!(fill, track);
+        assert!(progress_fill_rect(track, 0.0).is_none());
     }
 
     #[test]
