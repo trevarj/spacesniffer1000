@@ -4,7 +4,6 @@ use jwalk::{Parallelism, WalkDirGeneric};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt, fs,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -12,6 +11,9 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 pub type TreeIndex = usize;
 const MAX_SCAN_JOBS: usize = 2;
@@ -131,6 +133,7 @@ struct MetadataFingerprint {
 }
 
 impl MetadataFingerprint {
+    #[cfg(unix)]
     fn from_metadata(metadata: &fs::Metadata) -> Self {
         Self {
             dev: metadata.dev(),
@@ -140,6 +143,21 @@ impl MetadataFingerprint {
             mtime_nsec: metadata.mtime_nsec(),
             ctime: metadata.ctime(),
             ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        let (mtime, mtime_nsec) = system_time_parts(metadata.modified().ok());
+        let (ctime, ctime_nsec) = system_time_parts(metadata.created().ok());
+        Self {
+            dev: 0,
+            ino: 0,
+            len: metadata.len(),
+            mtime,
+            mtime_nsec,
+            ctime,
+            ctime_nsec,
         }
     }
 }
@@ -306,7 +324,7 @@ impl ActiveScan {
             metadata_error: false,
             parent: None,
             children: Vec::new(),
-            boundary_dev: Some(metadata.dev()),
+            boundary_dev: metadata_device(&metadata),
             scanned: false,
             scanning: false,
             summarized: !metadata.is_dir(),
@@ -1033,7 +1051,9 @@ fn scan_directory_level(
     tx: &Sender<ScanEvent>,
     wake_ui: Option<&ScanWake>,
 ) {
-    let root_dev = fs::symlink_metadata(&path).map(|meta| meta.dev()).ok();
+    let root_dev = fs::symlink_metadata(&path)
+        .ok()
+        .and_then(|meta| metadata_device(&meta));
     let mut children = Vec::with_capacity(CHILD_BATCH_SIZE);
     let mut stats = child_batch_stats();
 
@@ -1183,12 +1203,14 @@ fn summarize_path_with_jwalk(
         ..Default::default()
     };
 
-    if !options.cross_filesystems && root_dev.is_some_and(|root_dev| metadata.dev() != root_dev) {
+    if !options.cross_filesystems && crosses_device_boundary(metadata, root_dev) {
         return summary;
     }
 
     let mut visited = HashSet::new();
-    if metadata.nlink() > 1 && !visited.insert((metadata.dev(), metadata.ino())) {
+    if let Some(identity) = hardlink_identity(metadata)
+        && !visited.insert(identity)
+    {
         summary.size = 0;
         return summary;
     }
@@ -1227,7 +1249,7 @@ fn summarize_path_with_jwalk(
                 if let Ok(metadata) = &metadata
                     && entry.file_type.is_dir()
                     && !options.cross_filesystems
-                    && root_dev.is_some_and(|root_dev| metadata.dev() != root_dev)
+                    && crosses_device_boundary(metadata, root_dev)
                 {
                     entry.read_children_path = None;
                 }
@@ -1295,11 +1317,12 @@ fn summarize_path_with_jwalk(
                 continue;
             }
         };
-        if !options.cross_filesystems && root_dev.is_some_and(|root_dev| metadata.dev() != root_dev)
-        {
+        if !options.cross_filesystems && crosses_device_boundary(metadata, root_dev) {
             continue;
         }
-        if metadata.nlink() > 1 && !visited.insert((metadata.dev(), metadata.ino())) {
+        if let Some(identity) = hardlink_identity(metadata)
+            && !visited.insert(identity)
+        {
             continue;
         }
         summary.size += disk_size(metadata, options.apparent_size);
@@ -1382,12 +1405,65 @@ fn record_error_message(
     }
 }
 
+#[cfg(unix)]
+fn metadata_device(metadata: &fs::Metadata) -> Option<u64> {
+    Some(metadata.dev())
+}
+
+#[cfg(not(unix))]
+fn metadata_device(_metadata: &fs::Metadata) -> Option<u64> {
+    None
+}
+
+fn crosses_device_boundary(metadata: &fs::Metadata, root_dev: Option<u64>) -> bool {
+    root_dev
+        .zip(metadata_device(metadata))
+        .is_some_and(|(root_dev, dev)| dev != root_dev)
+}
+
+#[cfg(unix)]
+fn hardlink_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    (metadata.nlink() > 1).then(|| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn hardlink_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(not(unix))]
+fn system_time_parts(time: Option<SystemTime>) -> (i64, i64) {
+    let Some(time) = time else {
+        return (0, 0);
+    };
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => (duration.as_secs() as i64, duration.subsec_nanos() as i64),
+        Err(err) => {
+            let duration = err.duration();
+            (
+                -(duration.as_secs() as i64),
+                -(duration.subsec_nanos() as i64),
+            )
+        }
+    }
+}
+
 fn disk_size(metadata: &fs::Metadata, apparent_size: bool) -> u128 {
     if apparent_size {
         metadata.len() as u128
     } else {
-        metadata.blocks() as u128 * 512
+        disk_blocks_size(metadata)
     }
+}
+
+#[cfg(unix)]
+fn disk_blocks_size(metadata: &fs::Metadata) -> u128 {
+    metadata.blocks() as u128 * 512
+}
+
+#[cfg(not(unix))]
+fn disk_blocks_size(metadata: &fs::Metadata) -> u128 {
+    metadata.len() as u128
 }
 
 #[cfg(test)]
