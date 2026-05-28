@@ -30,7 +30,7 @@ jobs:
             binary: ss1000.exe
             artifact: ss1000-windows-x86_64
           - name: macOS x86_64
-            os: macos-13
+            os: macos-26-intel
             target: x86_64-apple-darwin
             binary: ss1000
             artifact: ss1000-macos-x86_64
