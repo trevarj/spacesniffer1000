@@ -8,19 +8,38 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  TARGET: x86_64-unknown-linux-gnu
 
 jobs:
-  linux-x86_64:
-    name: Linux x86_64
-    runs-on: ubuntu-latest
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: ss1000
+            artifact: ss1000-linux-x86_64
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: ss1000.exe
+            artifact: ss1000-windows-x86_64
+          - name: macOS x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            binary: ss1000
+            artifact: ss1000-macos-x86_64
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -39,14 +58,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --locked --bin ss1000 --target "$TARGET"
+        run: cargo build --release --locked --bin ss1000 --target "${{ matrix.target }}"
 
       - name: Package
+        shell: bash
         run: |
           version="${GITHUB_REF_NAME:-manual}"
-          archive="ss1000-${version}-${TARGET}"
+          archive="ss1000-${version}-${{ matrix.target }}"
           mkdir -p "dist/${archive}"
-          cp "target/${TARGET}/release/ss1000" "dist/${archive}/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${archive}/"
           cp README.md LICENSE* "dist/${archive}/" 2>/dev/null || true
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
           sha256sum "dist/${archive}.tar.gz" > "dist/${archive}.tar.gz.sha256"
@@ -54,7 +74,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ss1000-linux-x86_64
+          name: ${{ matrix.artifact }}
           path: |
             dist/*.tar.gz
             dist/*.sha256
